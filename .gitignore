@@ -1,0 +1,12 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+venv/
+.env
+
+# Models and large files
+school_attendance/models/
+school_attendance/embeddings/
+school_attendance/Silent-Face-Anti-Spoofing/
+*.whl
