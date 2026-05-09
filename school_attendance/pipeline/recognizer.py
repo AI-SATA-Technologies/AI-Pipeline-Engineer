@@ -1,70 +1,62 @@
 import insightface
 import faiss
 import numpy as np
+import pickle
 import os
 
 
 class FaceRecognizer:
-    def __init__(self, index_path='embeddings/face_index.bin', meta_path='embeddings/metadata.npy'):
-        """
-        Initialize FaceRecognizer with ArcFace R50 and FAISS vector search.
-        """
-        # Load recognition model (ArcFace R50)
-        # Note: 'detection' is required by FaceAnalysis even if we use a separate detector
-        self.app = insightface.app.FaceAnalysis(name='buffalo_l', allowed_modules=['detection', 'recognition'])
+    def __init__(self, threshold: float = 0.55,
+                 index_path: str = 'embeddings/faiss.index',
+                 names_path: str = 'embeddings/names.pkl'):
+        self.app = insightface.app.FaceAnalysis(
+            name='buffalo_l',
+            allowed_modules=['detection', 'recognition']
+        )
         self.app.prepare(ctx_id=0)
-        
+        self.threshold = threshold
         self.index_path = index_path
-        self.meta_path = meta_path
-        
-        # Load or initialize FAISS index
-        if os.path.exists(index_path) and os.path.exists(meta_path):
-            self.index = faiss.read_index(index_path)
-            self.metadata = np.load(meta_path, allow_pickle=True).item()
-        else:
-            # IndexFlatIP is for Inner Product (effectively Cosine Similarity for normalized embeddings)
-            self.index = faiss.IndexFlatIP(512) 
-            self.metadata = {}
+        self.names_path = names_path
+        self.index = None
+        self.names = []
+        self._load()
 
-    def get_embedding(self, face_crop):
-        """Extract 512-d normalized embedding from face crop."""
-        faces = self.app.get(face_crop)
+    def _load(self):
+        if os.path.exists(self.index_path) and os.path.exists(self.names_path):
+            self.index = faiss.read_index(self.index_path)
+            with open(self.names_path, 'rb') as f:
+                self.names = pickle.load(f)
+        else:
+            self.index = faiss.IndexFlatIP(512)
+
+    def add_student(self, name: str, embeddings: list):
+        avg = np.mean(embeddings, axis=0).astype(np.float32)
+        avg /= np.linalg.norm(avg)
+        self.index.add(avg[np.newaxis])
+        self.names.append(name)
+        os.makedirs(os.path.dirname(self.index_path) or '.', exist_ok=True)
+        faiss.write_index(self.index, self.index_path)
+        with open(self.names_path, 'wb') as f:
+            pickle.dump(self.names, f)
+
+    def get_embedding(self, face_img) -> np.ndarray | None:
+        faces = self.app.get(face_img)
         if not faces:
             return None
-        # Buffalo_L returns normed_embedding by default
         return faces[0].normed_embedding
 
-    def search(self, embedding, threshold=0.45):
-        """
-        Search for the closest match in the FAISS index.
-        Returns student_id if match found, else None.
-        """
+    def identify(self, face_img) -> tuple[str, float]:
         if self.index.ntotal == 0:
-            return None
-            
-        # Reshape embedding for FAISS
-        query_vector = np.array([embedding]).astype('float32')
-        
-        # Search for top-1
-        distances, indices = self.index.search(query_vector, 1)
-        
-        # In IndexFlatIP, higher distance means more similar (inner product)
-        if distances[0][0] > threshold:
-            idx = indices[0][0]
-            return self.metadata.get(idx)
-            
-        return None
+            return 'Unknown', 0.0
+        emb = self.get_embedding(face_img)
+        if emb is None:
+            return 'Unknown', 0.0
+        emb = emb[np.newaxis].astype(np.float32)
+        scores, indices = self.index.search(emb, 1)
+        score = float(scores[0][0])
+        if score >= self.threshold:
+            return self.names[indices[0][0]], score
+        return 'Unknown', score
 
-    def add_to_index(self, embedding, student_id):
-        """Add a new student embedding to the index and save."""
-        # FAISS index adds a copy of the embedding
-        self.index.add(np.array([embedding]).astype('float32'))
-        
-        # Map current index size - 1 to student_id
-        idx = self.index.ntotal - 1
-        self.metadata[idx] = student_id
-        
-        # Persistence
-        faiss.write_index(self.index, self.index_path)
-        np.save(self.meta_path, self.metadata)
-        print(f"Added student {student_id} to index. Total: {self.index.ntotal}")
+    def reload(self):
+        self._load()

@@ -1,67 +1,83 @@
-import cv2
+"""
+Full pipeline integration test.
+Uses test_face.jpg if present; falls back to a synthetic image.
+Run: python test_pipeline.py
+"""
 import os
+import sys
 import numpy as np
+import cv2
+
 from pipeline.detector import FaceDetector
 from pipeline.liveness import LivenessDetector
 from pipeline.recognizer import FaceRecognizer
-from pipeline.attendance import mark_attendance
+
+
+def make_test_image():
+    img = np.ones((480, 640, 3), dtype=np.uint8) * 200
+    cv2.putText(img, "Test Image (no face)", (120, 240),
+                cv2.FONT_HERSHEY_SIMPLEX, 1, (80, 80, 80), 2)
+    return img
+
 
 def main():
-    print("Initializing Pipeline...")
+    print("=" * 50)
+    print("Pipeline Integration Test")
+    print("=" * 50)
+
+    print("\n[1] Loading FaceDetector (SCRFD 500M)...")
     detector = FaceDetector()
-    
-    # Graceful handling for missing liveness models
+    print("    OK")
+
     liveness = None
-    if os.path.exists('models/2.7_80x80_MiniFASNetV2.onnx'):
-        liveness = LivenessDetector('models/2.7_80x80_MiniFASNetV2.onnx')
-        print("Liveness module loaded.")
+    model_path = 'models/2.7_80x80_MiniFASNetV2.onnx'
+    print(f"\n[2] Loading LivenessDetector...")
+    if os.path.exists(model_path):
+        liveness = LivenessDetector(model_path, threshold=0.70)
+        print("    OK")
     else:
-        print("Warning: Liveness model not found. Liveness check will be bypassed.")
-        
-    recognizer = FaceRecognizer()
-    print("Recognizer module loaded.")
+        print(f"    SKIPPED — model not found at {model_path}")
+        print("    Run 'python setup_liveness.py' to enable liveness detection.")
 
-    # Create dummy image for testing if no inputs provided
-    test_img_path = 'test_face.jpg'
-    if not os.path.exists(test_img_path):
-        # Create a black image with a white square as a placeholder
-        dummy_img = np.zeros((480, 640, 3), dtype=np.uint8)
-        cv2.putText(dummy_img, "No Input Camera/Image", (100, 240), cv2.FONT_HERSHEY_SIMPLEX, 1, (255, 255, 255), 2)
-        cv2.imwrite(test_img_path, dummy_img)
-        print(f"Created placeholder test image: {test_img_path}")
+    print("\n[3] Loading FaceRecognizer (ArcFace R50)...")
+    recognizer = FaceRecognizer(threshold=0.55)
+    print(f"    OK — {recognizer.index.ntotal} student(s) in index")
 
-    # Process test image
-    frame = cv2.imread(test_img_path)
+    img_path = 'test_face.jpg'
+    if os.path.exists(img_path):
+        frame = cv2.imread(img_path)
+        print(f"\n[4] Using image: {img_path}")
+    else:
+        frame = make_test_image()
+        print("\n[4] Using synthetic test image (no real face)")
+
     faces = detector.detect(frame)
-    print(f"Detected {len(faces)} faces.")
+    print(f"\nDetected {len(faces)} face(s)")
 
     for i, face in enumerate(faces):
         crop = detector.crop_face(frame, face)
-        
-        # 1. Liveness Check
-        is_live = True
-        l_score = 1.0
+        print(f"\n  Face {i + 1}:")
+        print(f"    BBox: {face.bbox.astype(int).tolist()}")
+        print(f"    Crop shape: {crop.shape}")
+
         if liveness:
-            is_live, l_score = liveness.is_live(crop)
-            print(f"Face {i}: Liveness Score: {l_score:.4f} (Live: {is_live})")
-        
-        if is_live:
-            # 2. Recognition Check
-            embedding = recognizer.get_embedding(crop)
-            if embedding is not None:
-                student_id = recognizer.search(embedding)
-                if student_id:
-                    print(f"Face {i}: Identified as Student ID: {student_id}")
-                    # 3. Mark Attendance (Requires DB connection)
-                    # mark_attendance(student_id)
-                else:
-                    print(f"Face {i}: Unknown Student")
-            else:
-                print(f"Face {i}: Failed to extract embedding")
-        else:
-            print(f"Face {i}: Spoof detected!")
+            is_live, score = liveness.check(crop)
+            print(f"    Liveness: {'LIVE' if is_live else 'SPOOF'} (score={score:.3f})")
+            if not is_live:
+                continue
 
-    print("Pipeline Test Completed.")
+        name, conf = recognizer.identify(crop)
+        print(f"    Identity: {name} (confidence={conf:.3f})")
 
-if __name__ == "__main__":
+    if not faces:
+        print("  (No faces to process — pipeline loaded successfully)")
+
+    print("\n" + "=" * 50)
+    print("All pipeline components loaded OK.")
+    if not os.path.exists(model_path):
+        print("NOTE: Run 'python setup_liveness.py' to enable liveness detection.")
+    print("=" * 50)
+
+
+if __name__ == '__main__':
     main()

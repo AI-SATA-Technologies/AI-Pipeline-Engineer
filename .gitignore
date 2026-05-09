@@ -10,3 +10,6 @@ school_attendance/models/
 school_attendance/embeddings/
 school_attendance/Silent-Face-Anti-Spoofing/
 *.whl
+
+# Claude Code session files
+.claude/

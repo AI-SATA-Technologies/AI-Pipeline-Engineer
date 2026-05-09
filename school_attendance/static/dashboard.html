@@ -1,0 +1,202 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Attendance Dashboard</title>
+<style>
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body { font-family: 'Segoe UI', system-ui, sans-serif; background: #f0f4f8; min-height: 100vh; }
+  .topbar { background: white; border-bottom: 1px solid #e2e8f0; padding: 14px 24px; display: flex; align-items: center; gap: 16px; flex-wrap: wrap; box-shadow: 0 1px 4px rgba(0,0,0,0.06); }
+  .back { color: #4f46e5; text-decoration: none; font-weight: 600; font-size: 0.9rem; }
+  h1 { font-size: 1.2rem; color: #1a202c; flex: 1; }
+  .controls { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; }
+  .controls input, .controls select { padding: 8px 12px; border: 1.5px solid #e2e8f0; border-radius: 8px; font-size: 0.9rem; }
+  .btn { padding: 8px 16px; border: none; border-radius: 8px; font-size: 0.88rem; font-weight: 600; cursor: pointer; transition: opacity 0.2s; }
+  .btn-blue { background: #4f46e5; color: white; }
+  .btn-green { background: #10b981; color: white; }
+  .btn:hover { opacity: 0.85; }
+  .layout { display: grid; grid-template-columns: 380px 1fr; gap: 20px; padding: 20px; max-width: 1400px; margin: 0 auto; }
+  @media(max-width: 900px) { .layout { grid-template-columns: 1fr; } }
+  .card { background: white; border-radius: 12px; padding: 20px; box-shadow: 0 2px 10px rgba(0,0,0,0.07); }
+  .card h2 { font-size: 1rem; color: #2d3748; margin-bottom: 14px; display: flex; align-items: center; gap: 8px; }
+  .feed-wrap { background: #1a202c; border-radius: 10px; overflow: hidden; aspect-ratio: 4/3; position: relative; }
+  #feed-img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .feed-off { position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center; color: #a0aec0; gap: 10px; }
+  .feed-off svg { width: 48px; height: 48px; opacity: 0.4; }
+  .ws-status { font-size: 0.75rem; color: #718096; margin-top: 8px; }
+  .ws-dot { display: inline-block; width: 7px; height: 7px; border-radius: 50%; background: #a0aec0; margin-right: 4px; }
+  .ws-dot.live { background: #48bb78; }
+  .stats { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  .stat { background: #f7fafc; border-radius: 8px; padding: 14px 16px; }
+  .stat-value { font-size: 1.8rem; font-weight: 700; color: #4f46e5; }
+  .stat-label { font-size: 0.78rem; color: #718096; margin-top: 2px; }
+  .table-wrap { overflow-x: auto; max-height: 480px; overflow-y: auto; }
+  table { width: 100%; border-collapse: collapse; font-size: 0.88rem; }
+  thead { position: sticky; top: 0; background: white; z-index: 1; }
+  th { text-align: left; padding: 10px 14px; color: #718096; font-size: 0.8rem; font-weight: 600; text-transform: uppercase; letter-spacing: 0.05em; border-bottom: 2px solid #e2e8f0; }
+  td { padding: 10px 14px; border-bottom: 1px solid #f0f4f8; color: #2d3748; }
+  tr:hover td { background: #f7fafc; }
+  .badge { display: inline-block; padding: 2px 10px; border-radius: 20px; font-size: 0.75rem; font-weight: 600; }
+  .badge-present { background: #c6f6d5; color: #276749; }
+  .empty-msg { text-align: center; color: #a0aec0; padding: 40px; }
+</style>
+</head>
+<body>
+<div class="topbar">
+  <a href="index.html" class="back">← Home</a>
+  <h1>📊 Attendance Dashboard</h1>
+  <div class="controls">
+    <input type="date" id="date-picker" onchange="loadAttendance()">
+    <input type="text" id="class-filter" placeholder="Class filter" style="width:120px" oninput="loadAttendance()">
+    <button class="btn btn-blue" onclick="loadAttendance()">🔄 Refresh</button>
+    <button class="btn btn-green" onclick="exportCSV()">⬇ Export CSV</button>
+  </div>
+</div>
+
+<div class="layout">
+  <div>
+    <div class="card" style="margin-bottom:16px;">
+      <h2>📹 Live Camera Feed</h2>
+      <div class="feed-wrap">
+        <img id="feed-img" alt="" style="display:none;">
+        <div class="feed-off" id="feed-off">
+          <svg viewBox="0 0 24 24" fill="currentColor"><path d="M15 8v8H5V8h10m1-2H4c-.55 0-1 .45-1 1v10c0 .55.45 1 1 1h12c.55 0 1-.45 1-1v-3.5l4 4v-11l-4 4V7c0-.55-.45-1-1-1z"/></svg>
+          <span>Not connected</span>
+        </div>
+      </div>
+      <div class="ws-status">
+        <span class="ws-dot" id="ws-dot"></span>
+        <span id="ws-status">Disconnected</span>
+      </div>
+      <button class="btn btn-blue" onclick="connectStream()" style="margin-top:12px; width:100%;">Connect Live Feed</button>
+    </div>
+
+    <div class="card">
+      <h2>Today's Summary</h2>
+      <div class="stats">
+        <div class="stat">
+          <div class="stat-value" id="count-present">—</div>
+          <div class="stat-label">Present today</div>
+        </div>
+        <div class="stat">
+          <div class="stat-value" id="count-total">—</div>
+          <div class="stat-label">Total students</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Attendance Records</h2>
+    <div class="table-wrap">
+      <table>
+        <thead>
+          <tr>
+            <th>Roll No.</th>
+            <th>Name</th>
+            <th>Class</th>
+            <th>Time</th>
+            <th>Confidence</th>
+            <th>Status</th>
+          </tr>
+        </thead>
+        <tbody id="tbody">
+          <tr><td colspan="6" class="empty-msg">Select a date to load records</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+let ws = null;
+
+function today() {
+  return new Date().toISOString().split('T')[0];
+}
+
+document.getElementById('date-picker').value = today();
+
+async function loadAttendance() {
+  const dateStr = document.getElementById('date-picker').value || today();
+  const cls = document.getElementById('class-filter').value.trim();
+  let url = `/api/attendance?date_str=${dateStr}`;
+  if (cls) url += `&class_name=${encodeURIComponent(cls)}`;
+
+  try {
+    const res = await fetch(url);
+    const rows = await res.json();
+    renderTable(rows);
+    document.getElementById('count-present').textContent = rows.length;
+
+    const tot = await fetch('/api/students');
+    const students = await tot.json();
+    document.getElementById('count-total').textContent = students.length;
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function renderTable(rows) {
+  const tbody = document.getElementById('tbody');
+  if (!rows.length) {
+    tbody.innerHTML = '<tr><td colspan="6" class="empty-msg">No attendance records found</td></tr>';
+    return;
+  }
+  tbody.innerHTML = rows.map(r => `
+    <tr>
+      <td>${r.roll_number}</td>
+      <td><strong>${r.name}</strong></td>
+      <td>${r.class_name || ''} ${r.section || ''}</td>
+      <td>${r.marked_at ? r.marked_at.substring(11, 19) : ''}</td>
+      <td>${r.confidence !== null ? (r.confidence * 100).toFixed(1) + '%' : '—'}</td>
+      <td><span class="badge badge-present">Present</span></td>
+    </tr>
+  `).join('');
+}
+
+function exportCSV() {
+  const dateStr = document.getElementById('date-picker').value || today();
+  window.open(`/api/attendance/export?date_str=${dateStr}`, '_blank');
+}
+
+function connectStream() {
+  if (ws) { ws.close(); ws = null; }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/stream`);
+  ws.binaryType = 'arraybuffer';
+
+  ws.onopen = () => {
+    document.getElementById('ws-dot').classList.add('live');
+    document.getElementById('ws-status').textContent = 'Live';
+    document.getElementById('feed-off').style.display = 'none';
+    document.getElementById('feed-img').style.display = 'block';
+  };
+
+  ws.onmessage = (e) => {
+    const blob = new Blob([e.data], { type: 'image/jpeg' });
+    const url = URL.createObjectURL(blob);
+    const img = document.getElementById('feed-img');
+    const old = img.src;
+    img.src = url;
+    if (old) URL.revokeObjectURL(old);
+  };
+
+  ws.onclose = () => {
+    document.getElementById('ws-dot').classList.remove('live');
+    document.getElementById('ws-status').textContent = 'Disconnected';
+    document.getElementById('feed-off').style.display = '';
+    document.getElementById('feed-img').style.display = 'none';
+  };
+
+  ws.onerror = () => {
+    document.getElementById('ws-status').textContent = 'Connection failed';
+  };
+}
+
+loadAttendance();
+setInterval(loadAttendance, 15000);
+</script>
+</body>
+</html>
