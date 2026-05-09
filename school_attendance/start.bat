@@ -12,7 +12,7 @@ if not exist ".env" (
 )
 
 echo [1/2] Starting MySQL...
-call start_mysql.bat
+call "%~dp0start_mysql.bat"
 
 echo [2/2] Starting FastAPI server on http://localhost:8000 ...
 echo.

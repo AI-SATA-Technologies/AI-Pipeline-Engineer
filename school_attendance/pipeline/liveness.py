@@ -22,5 +22,5 @@ class LivenessDetector:
         img = np.transpose(img, (2, 0, 1))[np.newaxis].astype(np.float32)
         out = self.sess.run(None, {self.sess.get_inputs()[0].name: img})[0][0]
         e = np.exp(out - out.max())
-        live_score = float(e[1] / e.sum())
+        live_score = float(e[0] / e.sum())   # index 0 = live, index 1 = spoof
         return live_score >= self.threshold, live_score
