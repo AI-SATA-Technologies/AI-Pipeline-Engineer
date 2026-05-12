@@ -1,0 +1,182 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Registered Students</title>
+<link rel="stylesheet" href="students.css">
+</head>
+<body>
+
+<div class="topbar">
+  <a href="dashboard.html" class="back">← Dashboard</a>
+  <h1>👥 Registered Students</h1>
+  <a href="register.html" class="btn btn-green">+ Register New Student</a>
+</div>
+
+<div class="container">
+
+  <!-- Stats -->
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="num" id="total-count">—</div>
+      <div class="label">Total Students</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="class-count">—</div>
+      <div class="label">Total Classes</div>
+    </div>
+    <div class="stat-card">
+      <div class="num" id="today-present">—</div>
+      <div class="label">Present Today</div>
+    </div>
+  </div>
+
+  <!-- Table -->
+  <div class="card">
+    <div class="search-row">
+      <input type="text" id="search" placeholder="🔍 Search by name or roll number..." oninput="filterStudents()">
+      <input type="text" id="class-filter" placeholder="Filter by class..." oninput="filterStudents()" style="max-width:200px;">
+      <button class="btn btn-blue" onclick="loadStudents()">🔄 Refresh</button>
+    </div>
+
+    <div id="table-container">
+      <div class="loading">
+        <div class="spinner"></div>
+        Loading students...
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- Toast -->
+<div class="toast" id="toast"></div>
+
+<script>
+let allStudents = [];
+
+async function loadStudents() {
+  document.getElementById('table-container').innerHTML = `
+    <div class="loading"><div class="spinner"></div>Loading students...</div>`;
+
+  try {
+    const res = await fetch('/api/students');
+    allStudents = await res.json();
+
+    // Update stats
+    document.getElementById('total-count').textContent = allStudents.length;
+    const classes = new Set(allStudents.map(s => s.class_name).filter(Boolean));
+    document.getElementById('class-count').textContent = classes.size;
+
+    // Load today's attendance count
+    const today = new Date().toISOString().split('T')[0];
+    const attRes = await fetch(`/api/attendance?date_str=${today}`);
+    const att = await attRes.json();
+    document.getElementById('today-present').textContent = att.length;
+
+    renderTable(allStudents);
+  } catch(e) {
+    document.getElementById('table-container').innerHTML =
+      '<p style="color:red; padding:20px;">❌ Error loading students!</p>';
+  }
+}
+
+function filterStudents() {
+  const search = document.getElementById('search').value.toLowerCase();
+  const cls    = document.getElementById('class-filter').value.toLowerCase();
+
+  const filtered = allStudents.filter(s => {
+    const matchSearch = s.name.toLowerCase().includes(search) ||
+                        s.roll_number.toLowerCase().includes(search);
+    const matchClass  = cls ? (s.class_name || '').toLowerCase().includes(cls) : true;
+    return matchSearch && matchClass;
+  });
+
+  renderTable(filtered);
+}
+
+function renderTable(students) {
+  if (!students.length) {
+    document.getElementById('table-container').innerHTML = `
+      <div class="empty">
+        <svg viewBox="0 0 24 24" fill="currentColor"><path d="M12 12c2.7 0 4.8-2.1 4.8-4.8S14.7 2.4 12 2.4 7.2 4.5 7.2 7.2 9.3 12 12 12zm0 2.4c-3.2 0-9.6 1.6-9.6 4.8v2.4h19.2v-2.4c0-3.2-6.4-4.8-9.6-4.8z"/></svg>
+        <p>Koi student nahi mila!</p>
+      </div>`;
+    return;
+  }
+
+  document.getElementById('table-container').innerHTML = `
+    <table>
+      <thead>
+        <tr>
+          <th>#</th>
+          <th>Student</th>
+          <th>Roll Number</th>
+          <th>Class</th>
+          <th>Section</th>
+          <th>Registered On</th>
+          <th>Status</th>
+          <th>Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        ${students.map((s, i) => `
+          <tr id="row-${s.id}">
+            <td style="color:#a0aec0; font-size:0.85rem;">${i + 1}</td>
+            <td>
+              <div class="name-cell">
+                <div class="avatar">${s.name.charAt(0).toUpperCase()}</div>
+                <strong>${s.name}</strong>
+              </div>
+            </td>
+            <td style="font-family:monospace; color:#4f46e5;">${s.roll_number}</td>
+            <td>${s.class_name || '—'}</td>
+            <td>${s.section || '—'}</td>
+            <td style="color:#718096; font-size:0.85rem;">${s.registered_at ? s.registered_at.substring(0,10) : '—'}</td>
+            <td><span class="badge badge-active">✅ Active</span></td>
+            <td>
+              <button class="delete-btn" onclick="deleteStudent(${s.id}, '${s.name}')">
+                🗑️ Delete
+              </button>
+            </td>
+          </tr>
+        `).join('')}
+      </tbody>
+    </table>`;
+}
+
+async function deleteStudent(id, name) {
+  if (!confirm(`Kya aap sure hain?\n\n"${name}" delete ho jayega!\nYeh wapas nahi aayega.`)) return;
+
+  try {
+    const res  = await fetch(`/api/student/${id}`, { method: 'DELETE' });
+    const data = await res.json();
+
+    if (data.success) {
+      // Remove from local array
+      allStudents = allStudents.filter(s => s.id !== id);
+      // Remove row from table
+      const row = document.getElementById(`row-${id}`);
+      if (row) row.style.animation = 'fadeOut 0.3s ease forwards';
+      setTimeout(() => { loadStudents(); }, 300);
+      showToast(`✅ "${name}" delete ho gaya!`, 'success');
+    } else {
+      showToast('❌ Delete failed!', 'error');
+    }
+  } catch(e) {
+    showToast('❌ Error: ' + e.message, 'error');
+  }
+}
+
+function showToast(msg, type) {
+  const toast = document.getElementById('toast');
+  toast.textContent = msg;
+  toast.className = `toast ${type} show`;
+  setTimeout(() => { toast.className = 'toast'; }, 3000);
+}
+
+// Load on page open
+loadStudents();
+</script>
+</body>
+</html>
