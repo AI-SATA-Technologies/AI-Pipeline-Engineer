@@ -1,133 +1,61 @@
 """
-Active liveness challenges using buffalo_l 2d106det landmarks.
+Active liveness challenges using the 5 keypoints already returned by the
+main SCRFD face detector — no extra model required.
+
+Keypoint layout (InsightFace):
+  kps[0] = left eye,  kps[1] = right eye,  kps[2] = nose tip
+  kps[3] = left mouth corner,  kps[4] = right mouth corner
 
 Challenges:
-  - blink         : detect rapid drop+rise in Eye-Aspect-Ratio (EAR)
-  - smile         : detect rise in Mouth-Aspect-Ratio (smile widens & flattens)
-  - turn_left     : nose moves significantly left of face center
-  - turn_right    : nose moves significantly right of face center
+  - smile       : mouth widens relative to neutral baseline
+  - turn_left   : nose shifts left of eye midpoint
+  - turn_right  : nose shifts right of eye midpoint
+  - nod         : face center drops then returns (head nod)
 """
-import os
-import insightface
 import numpy as np
-import cv2
 
 
-# ── 106-point landmark indices used by InsightFace 2d106det ────────────
-# Reference: insightface buffalo_l 2d106 landmarks
-LM = {
-    # Right eye contour (subject's right, image left)
-    'right_eye': [35, 36, 33, 37, 39, 42, 40, 41],
-    # Left eye contour
-    'left_eye':  [89, 90, 87, 91, 93, 96, 94, 95],
-    # Mouth (outer)
-    'mouth_left':   52,
-    'mouth_right':  61,
-    'mouth_top':    72,
-    'mouth_bottom': 85,
-    # Nose tip
-    'nose_tip': 86,
-    # Face contour
-    'face_left':  1,
-    'face_right': 17,
-}
-
-
-class LandmarkExtractor:
-    """Loads buffalo_l 2d106det.onnx for 106 facial landmarks."""
-    def __init__(self):
-        self.app = insightface.app.FaceAnalysis(
-            name='buffalo_l',
-            allowed_modules=['detection', 'landmark_2d_106']
-        )
-        self.app.prepare(ctx_id=0, det_size=(320, 320))
-
-    def get_landmarks(self, frame) -> np.ndarray | None:
-        faces = self.app.get(frame)
-        if not faces:
-            return None
-        f = faces[0]
-        return getattr(f, 'landmark_2d_106', None)
-
-
-def _eye_aspect_ratio(pts: np.ndarray) -> float:
-    """EAR — small when eye closed, large when open."""
-    if pts is None or len(pts) < 6:
-        return 0.0
-    # vertical / horizontal distances
-    A = np.linalg.norm(pts[1] - pts[5])
-    B = np.linalg.norm(pts[2] - pts[4])
-    C = np.linalg.norm(pts[0] - pts[3])
-    if C == 0:
-        return 0.0
-    return (A + B) / (2.0 * C)
-
-
-def compute_metrics(lm106: np.ndarray) -> dict:
-    """Single-frame facial metrics from 106 landmarks."""
-    if lm106 is None or len(lm106) < 106:
+def compute_metrics(face) -> dict:
+    """Return challenge metrics from a detected face object."""
+    kps = getattr(face, 'kps', None)
+    bbox = getattr(face, 'bbox', None)
+    if kps is None or bbox is None or len(kps) < 5:
         return {}
 
-    le = lm106[LM['left_eye'][:6]]
-    re = lm106[LM['right_eye'][:6]]
-    ear = (_eye_aspect_ratio(le) + _eye_aspect_ratio(re)) / 2.0
+    left_eye, right_eye, nose, left_mouth, right_mouth = [np.array(p, dtype=float) for p in kps[:5]]
+    x1, y1, x2, y2 = float(bbox[0]), float(bbox[1]), float(bbox[2]), float(bbox[3])
+    face_w = x2 - x1
+    face_h = y2 - y1
+    if face_w <= 0 or face_h <= 0:
+        return {}
 
-    m_l = lm106[LM['mouth_left']]
-    m_r = lm106[LM['mouth_right']]
-    m_t = lm106[LM['mouth_top']]
-    m_b = lm106[LM['mouth_bottom']]
-    mouth_w = float(np.linalg.norm(m_r - m_l))
-    mouth_h = float(np.linalg.norm(m_b - m_t))
+    eye_mid_x = (left_eye[0] + right_eye[0]) / 2.0
 
-    nose = lm106[LM['nose_tip']]
-    f_l = lm106[LM['face_left']]
-    f_r = lm106[LM['face_right']]
-    face_w = float(np.linalg.norm(f_r - f_l))
-    if face_w == 0:
-        nose_x_norm = 0.0
-    else:
-        # 0.5 = nose centered, <0.5 = turned right, >0.5 = turned left
-        # (image coords: smaller x = left of image)
-        face_center_x = (f_l[0] + f_r[0]) / 2.0
-        nose_x_norm = (nose[0] - face_center_x) / face_w
+    # Positive = nose right of eye midpoint (head turned left in image)
+    # Negative = nose left of eye midpoint (head turned right in image)
+    nose_x_norm = (float(nose[0]) - eye_mid_x) / face_w
+
+    # Face bounding-box vertical centre (pixels) — shifts when person nods
+    face_center_y = (y1 + y2) / 2.0
+
+    # Mouth width as fraction of face width — increases when smiling
+    mouth_width = float(np.linalg.norm(right_mouth - left_mouth))
+    mouth_ratio = mouth_width / face_w
 
     return {
-        'ear': float(ear),
-        'mouth_w': mouth_w,
-        'mouth_h': mouth_h,
-        'mouth_ratio': mouth_w / mouth_h if mouth_h > 0 else 0.0,
-        'nose_x_norm': float(nose_x_norm),
+        'nose_x_norm': nose_x_norm,
+        'face_center_y': face_center_y,
+        'face_h': face_h,
+        'mouth_ratio': mouth_ratio,
         'face_w': face_w,
     }
 
 
-# ── Challenge state machines ───────────────────────────────────────────
-
-class BlinkChallenge:
-    """Pass when EAR drops below low threshold then rises back."""
-    EAR_OPEN = 0.22
-    EAR_CLOSE = 0.15
-    label = 'Please blink your eyes'
-
-    def __init__(self):
-        self.saw_close = False
-        self.passed = False
-
-    def update(self, m: dict) -> bool:
-        if not m:
-            return self.passed
-        ear = m.get('ear', 0)
-        if ear < self.EAR_CLOSE:
-            self.saw_close = True
-        elif ear > self.EAR_OPEN and self.saw_close:
-            self.passed = True
-        return self.passed
-
+# ── Challenge state machines ───────────────────────────────────────────────
 
 class SmileChallenge:
-    """Pass when mouth ratio (width/height) increases significantly above baseline."""
-    BASELINE_FRAMES = 5
-    DELTA = 0.6     # mouth_ratio must increase by ≥ 0.6
+    BASELINE_FRAMES = 8
+    DELTA = 0.08    # mouth_ratio must rise ≥ 8 pp above neutral baseline
     label = 'Please smile'
 
     def __init__(self):
@@ -137,20 +65,19 @@ class SmileChallenge:
     def update(self, m: dict) -> bool:
         if not m:
             return self.passed
-        ratio = m.get('mouth_ratio', 0)
+        ratio = m.get('mouth_ratio', 0.0)
         if len(self.baseline) < self.BASELINE_FRAMES:
             self.baseline.append(ratio)
             return False
-        base = np.mean(self.baseline)
-        if ratio > base + self.DELTA:
+        if ratio > float(np.mean(self.baseline)) + self.DELTA:
             self.passed = True
         return self.passed
 
 
 class HeadTurnChallenge:
-    """Pass when nose moves left or right beyond threshold from baseline."""
-    BASELINE_FRAMES = 5
-    DELTA = 0.12
+    BASELINE_FRAMES = 8
+    DELTA = 0.07    # nose must shift ≥ 7% of face width from neutral
+
     def __init__(self, direction: str):
         assert direction in ('left', 'right')
         self.direction = direction
@@ -161,11 +88,11 @@ class HeadTurnChallenge:
     def update(self, m: dict) -> bool:
         if not m:
             return self.passed
-        x = m.get('nose_x_norm', 0)
+        x = m.get('nose_x_norm', 0.0)
         if len(self.baseline) < self.BASELINE_FRAMES:
             self.baseline.append(x)
             return False
-        base = np.mean(self.baseline)
+        base = float(np.mean(self.baseline))
         if self.direction == 'left' and x > base + self.DELTA:
             self.passed = True
         elif self.direction == 'right' and x < base - self.DELTA:
@@ -173,9 +100,40 @@ class HeadTurnChallenge:
         return self.passed
 
 
+class NodChallenge:
+    """Pass when face centre drops ≥ 5% of face height then returns up."""
+    BASELINE_FRAMES = 8
+    DELTA = 0.05
+    label = 'Please nod your head'
+
+    def __init__(self):
+        self.baseline_y = []
+        self.baseline_h = []
+        self.saw_down = False
+        self.passed = False
+
+    def update(self, m: dict) -> bool:
+        if not m:
+            return self.passed
+        cy = m.get('face_center_y', 0.0)
+        fh = m.get('face_h', 1.0)
+        if len(self.baseline_y) < self.BASELINE_FRAMES:
+            self.baseline_y.append(cy)
+            self.baseline_h.append(fh)
+            return False
+        base_y = float(np.mean(self.baseline_y))
+        base_h = float(np.mean(self.baseline_h)) or 1.0
+        offset = (cy - base_y) / base_h   # positive = moved down
+        if offset > self.DELTA:
+            self.saw_down = True
+        elif self.saw_down and offset < self.DELTA / 2:
+            self.passed = True
+        return self.passed
+
+
 def make_challenge(name: str):
-    if name == 'blink':       return BlinkChallenge()
     if name == 'smile':       return SmileChallenge()
     if name == 'turn_left':   return HeadTurnChallenge('left')
     if name == 'turn_right':  return HeadTurnChallenge('right')
+    if name == 'nod':         return NodChallenge()
     raise ValueError(f'Unknown challenge: {name}')

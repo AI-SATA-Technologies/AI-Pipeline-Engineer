@@ -1,32 +1,38 @@
-CREATE DATABASE IF NOT EXISTS school_attendance;
-USE school_attendance;
+-- PostgreSQL schema for School Face Attendance System
+-- No extensions required — embeddings stored as BYTEA, searched in Python.
+--
+-- Run once:
+--   psql -U postgres -f schema.sql
+
+CREATE DATABASE school_attendance;
+\c school_attendance;
 
 CREATE TABLE IF NOT EXISTS students (
-    id           INT AUTO_INCREMENT PRIMARY KEY,
-    name         VARCHAR(100) NOT NULL,
-    roll_number  VARCHAR(50) UNIQUE NOT NULL,
-    class_name   VARCHAR(50),
-    section      VARCHAR(10),
-    photo_path   VARCHAR(255),
-    registered_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-    is_active    BOOLEAN DEFAULT TRUE
+    id            SERIAL PRIMARY KEY,
+    name          VARCHAR(100) NOT NULL,
+    roll_number   VARCHAR(50) UNIQUE NOT NULL,
+    class_name    VARCHAR(50),
+    section       VARCHAR(10),
+    registered_at TIMESTAMP DEFAULT NOW(),
+    is_active     BOOLEAN DEFAULT TRUE
 );
 
 CREATE TABLE IF NOT EXISTS attendance (
-    id           INT AUTO_INCREMENT PRIMARY KEY,
-    student_id   INT NOT NULL,
-    date         DATE NOT NULL,
-    marked_at    DATETIME DEFAULT CURRENT_TIMESTAMP,
-    confidence   FLOAT,
-    camera_id    VARCHAR(50),
-    FOREIGN KEY (student_id) REFERENCES students(id),
-    UNIQUE KEY unique_daily (student_id, date)
+    id         SERIAL PRIMARY KEY,
+    student_id INT NOT NULL REFERENCES students(id),
+    date       DATE NOT NULL,
+    marked_at  TIMESTAMP DEFAULT NOW(),
+    confidence FLOAT,
+    camera_id  VARCHAR(50),
+    UNIQUE (student_id, date)
 );
 
+-- One averaged 512-dim float32 embedding per student stored as raw bytes.
+-- UNIQUE(student_id) lets re-registration update the existing row cleanly.
 CREATE TABLE IF NOT EXISTS embeddings (
-    id           INT AUTO_INCREMENT PRIMARY KEY,
-    student_id   INT NOT NULL,
-    created_at   DATETIME DEFAULT CURRENT_TIMESTAMP,
+    id           SERIAL PRIMARY KEY,
+    student_id   INT NOT NULL REFERENCES students(id) UNIQUE,
+    created_at   TIMESTAMP DEFAULT NOW(),
     sample_count INT DEFAULT 0,
-    FOREIGN KEY (student_id) REFERENCES students(id)
+    vector       BYTEA NOT NULL
 );
