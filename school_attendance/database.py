@@ -2,7 +2,6 @@ import threading
 
 import numpy as np
 import psycopg2
-import psycopg2.extras
 
 from config import DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SIMILARITY_THRESHOLD
 
@@ -135,26 +134,3 @@ def store_lms_embedding(lms_student_id: str, embedding: np.ndarray, sample_count
     cursor.close(); conn.close()
 
 
-# ─── Legacy embedding storage (original /api/register flow) ───────────────────
-
-def store_embedding(student_id: int, embedding: np.ndarray, sample_count: int) -> None:
-    vec_bytes = embedding.astype(np.float32).tobytes()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''INSERT INTO embeddings (student_id, sample_count, vector)
-           VALUES (%s, %s, %s)
-           ON CONFLICT (student_id) DO UPDATE
-               SET vector       = EXCLUDED.vector,
-                   sample_count = EXCLUDED.sample_count,
-                   created_at   = NOW()''',
-        (student_id, sample_count, psycopg2.Binary(vec_bytes)),
-    )
-    conn.commit()
-    cursor.close(); conn.close()
-
-
-# ─── Count ────────────────────────────────────────────────────────────────────
-
-def count_registered_students() -> int:
-    return len(embedding_cache)

@@ -1,6 +1,4 @@
 import asyncio
-import os
-import json
 import time
 from contextlib import asynccontextmanager
 from datetime import datetime
@@ -8,33 +6,14 @@ from typing import Optional
 
 import cv2
 import numpy as np
-import psycopg2.extras
 import requests
-from fastapi import FastAPI, File, UploadFile, Form, WebSocket, HTTPException, WebSocketDisconnect
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
 
-from config import MODE, LIVENESS_MODEL_PATH, LIVENESS_THRESHOLD, MIN_REGISTRATION_SAMPLES, LMS_API_URL
-from database import (
-    get_db_connection,
-    embedding_cache,
-    store_embedding,
-    store_lms_embedding,
-    count_registered_students,
-)
+from config import MODE, MIN_REGISTRATION_SAMPLES, LMS_API_URL, CAMERA_URL
+from database import embedding_cache, store_lms_embedding
 from pipeline.detector import FaceDetector
-from pipeline.liveness import LivenessDetector
 from pipeline.recognizer import FaceRecognizer
-
-@asynccontextmanager
-async def lifespan(_: FastAPI):
-    count = await asyncio.to_thread(embedding_cache.load)
-    print(f'[cache] {count} student embedding(s) loaded into memory')
-    yield
-
-
-app = FastAPI(title='School Face Attendance API', version='3.0', lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
 
 # ─── Pipeline ─────────────────────────────────────────────────────────────────
@@ -47,11 +26,8 @@ class Pipeline:
 
 pipeline = Pipeline()
 
-liveness: Optional[LivenessDetector] = None
-if os.path.exists(LIVENESS_MODEL_PATH):
-    liveness = LivenessDetector(LIVENESS_MODEL_PATH, threshold=LIVENESS_THRESHOLD)
-    print('[pipeline] Liveness model loaded')
 
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _identify(aligned: np.ndarray) -> tuple[str, float]:
     emb = pipeline.recognizer.get_embedding(aligned)
@@ -76,111 +52,130 @@ async def _notify_lms(student_id: str) -> None:
         print(f'[lms] notify failed for {student_id}: {exc}')
 
 
+def _process_frame_sync(frame: np.ndarray) -> list[tuple[str, float]]:
+    """Detect and identify all known faces in one frame. Runs in a thread pool."""
+    out = []
+    for face in pipeline.detector.detect(frame):
+        aligned = pipeline.detector.align_face(frame, face)
+        student_id, conf = _identify(aligned)
+        if student_id != 'Unknown':
+            out.append((student_id, conf))
+    return out
+
+
+# ─── Camera background task ───────────────────────────────────────────────────
+
+_camera_state: dict = {'running': False, 'connected': False}
+
+
+async def _camera_loop() -> None:
+    """
+    Connects to CAMERA_URL and processes every frame indefinitely.
+    Auto-reconnects on stream loss. Runs for the full server lifetime.
+    """
+    RECONNECT_DELAY = 5.0
+    COOLDOWN = 30.0
+    recent_marks: dict[str, float] = {}
+    cap: Optional[cv2.VideoCapture] = None
+    miss = 0
+
+    _camera_state['running'] = True
+    try:
+        while True:
+            if cap is None or not cap.isOpened():
+                _camera_state['connected'] = False
+                print(f'[camera] connecting -> {CAMERA_URL}')
+                cap = await asyncio.to_thread(lambda: cv2.VideoCapture(CAMERA_URL))
+                if not cap.isOpened():
+                    print(f'[camera] connection failed, retry in {RECONNECT_DELAY}s')
+                    cap = None
+                    await asyncio.sleep(RECONNECT_DELAY)
+                    continue
+                miss = 0
+                _camera_state['connected'] = True
+                print('[camera] connected')
+
+            ret, frame = await asyncio.to_thread(cap.read)
+            if not ret:
+                miss += 1
+                if miss >= 10:
+                    print('[camera] stream lost, reconnecting')
+                    cap.release()
+                    cap = None
+                    await asyncio.sleep(RECONNECT_DELAY)
+                else:
+                    await asyncio.sleep(0.05)
+                continue
+            miss = 0
+
+            detections = await asyncio.to_thread(_process_frame_sync, frame)
+            now = time.time()
+            for student_id, conf in detections:
+                if now - recent_marks.get(student_id, 0) > COOLDOWN:
+                    recent_marks[student_id] = now
+                    await _notify_lms(student_id)
+                    embedding_cache.remove(student_id)
+                    print(f'[camera] marked {student_id} ({conf:.1%})')
+
+            await asyncio.sleep(0)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        _camera_state['running'] = False
+        _camera_state['connected'] = False
+        if cap and cap.isOpened():
+            cap.release()
+        print('[camera] background task stopped')
+
+
+# ─── App + Lifespan ───────────────────────────────────────────────────────────
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    count = await asyncio.to_thread(embedding_cache.load)
+    print(f'[cache] {count} student embedding(s) loaded into memory')
+
+    cam_task = None
+    if CAMERA_URL != '' and CAMERA_URL is not None:
+        cam_task = asyncio.create_task(_camera_loop())
+        print(f'[camera] background task started -> {CAMERA_URL}')
+    else:
+        print('[camera] CAMERA_URL not set — background task disabled')
+
+    yield
+
+    if cam_task:
+        cam_task.cancel()
+        try:
+            await cam_task
+        except asyncio.CancelledError:
+            pass
+
+
+app = FastAPI(title='School Face Attendance API', version='3.0', lifespan=lifespan)
+app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
+
+
 # ─── Status ───────────────────────────────────────────────────────────────────
 @app.get('/api/status')
 def status():
     return {
         'status': 'running',
         'mode': MODE,
-        'liveness_enabled': liveness is not None,
-        'students_in_db': count_registered_students(),
+        'students_pending': len(embedding_cache),
     }
 
 
-# ─── Camera: MJPEG HTTP stream ────────────────────────────────────────────────
-@app.get('/api/camera/stream')
-async def camera_stream():
-    """
-    MJPEG live feed with face detection overlays (view only — no attendance marking).
-    Consume as:  <img src="http://host:8000/api/camera/stream">
-    """
-    cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-
-    async def gen():
-        try:
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
-                for face in pipeline.detector.detect(frame):
-                    x1, y1, x2, y2 = face.bbox.astype(int)
-                    aligned = pipeline.detector.align_face(frame, face)
-                    name, conf = _identify(aligned)
-                    color = (0, 255, 0) if name != 'Unknown' else (0, 165, 255)
-                    cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                    cv2.putText(frame, f'{name} {conf:.0%}', (x1, y1 - 10),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-                yield b'--frame\r\nContent-Type: image/jpeg\r\n\r\n' + buf.tobytes() + b'\r\n'
-                await asyncio.sleep(0.04)
-        finally:
-            cap.release()
-
-    return StreamingResponse(gen(), media_type='multipart/x-mixed-replace; boundary=frame')
-
-
-# ─── Camera: WebSocket stream ─────────────────────────────────────────────────
-@app.websocket('/ws/camera')
-async def camera_ws(websocket: WebSocket):
-    """
-    WebSocket live feed with automatic LMS notification on detection.
-    Binary messages : JPEG frame bytes (render as video).
-    Text messages   : JSON detection events.
-      {"type": "detection", "student_id": "...", "confidence": 0.92}
-    """
-    await websocket.accept()
-    cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
-    for _ in range(8):
-        cap.read()  # camera warmup
-
-    recent_marks: dict[str, float] = {}
-    COOLDOWN = 30.0
-    miss = 0
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                miss += 1
-                if miss >= 10:
-                    break
-                await asyncio.sleep(0.05)
-                continue
-            miss = 0
-
-            for face in pipeline.detector.detect(frame):
-                x1, y1, x2, y2 = face.bbox.astype(int)
-                aligned = pipeline.detector.align_face(frame, face)
-                student_id, conf = _identify(aligned)
-                color = (0, 255, 0) if student_id != 'Unknown' else (0, 165, 255)
-                cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f'{student_id} {conf:.0%}', (x1, y1 - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-
-                now = time.time()
-                if student_id != 'Unknown' and now - recent_marks.get(student_id, 0) > COOLDOWN:
-                    recent_marks[student_id] = now
-                    await _notify_lms(student_id)
-                    embedding_cache.remove(student_id)
-                    try:
-                        await websocket.send_text(json.dumps({
-                            'type': 'detection',
-                            'student_id': student_id,
-                            'confidence': round(float(conf), 3),
-                        }))
-                    except Exception:
-                        pass
-
-            _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
-            await websocket.send_bytes(buf.tobytes())
-            await asyncio.sleep(0.04)
-    except WebSocketDisconnect:
-        pass
-    finally:
-        cap.release()
+# ─── Camera status ────────────────────────────────────────────────────────────
+@app.get('/api/camera/status')
+def camera_status():
+    return {
+        'task_running': _camera_state['running'],
+        'connected': _camera_state['connected'],
+        'url_configured': CAMERA_URL != '' and CAMERA_URL is not None,
+        'students_pending': len(embedding_cache),
+    }
 
 
 # ─── Process single frame ──────────────────────────────────────────────────────
@@ -190,7 +185,7 @@ async def process_frame(
 ):
     """
     Submit a single JPEG frame. Notifies the LMS for each recognised face.
-    Use for edge devices / IP cameras that send frames on their own schedule.
+    Use for edge devices / IP cameras that push frames on their own schedule.
     """
     data = await file.read()
     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
@@ -263,9 +258,7 @@ async def register_from_lms(
     avg = np.mean(embeddings, axis=0).astype(np.float32)
     avg /= np.linalg.norm(avg)
 
-    # Persist to PostgreSQL — only student_id + embedding vector, never the images
     store_lms_embedding(student_id, avg, len(embeddings))
-    # Mirror into the in-memory cache so detection is instant without a reload
     embedding_cache.add(student_id, avg)
 
     return {
@@ -274,98 +267,6 @@ async def register_from_lms(
         'samples_used': len(embeddings),
         'photos_failed': failed,
     }
-
-
-# ─── Register student ──────────────────────────────────────────────────────────
-@app.post('/api/register')
-async def register_student(
-    name: str = Form(...),
-    roll_number: str = Form(...),
-    class_name: str = Form(...),
-    section: str = Form(''),
-    photos: list[UploadFile] = File(...),
-):
-    """
-    Register a new student with face photos.
-    Detects faces, computes ArcFace embeddings, averages them,
-    and stores the single 512-dim vector in PostgreSQL via pgvector.
-    Requires at least MIN_REGISTRATION_SAMPLES valid face detections.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT id FROM students WHERE roll_number=%s', (roll_number,))
-    if cursor.fetchone():
-        cursor.close(); conn.close()
-        return {'success': False, 'error': 'Roll number already registered'}
-
-    embeddings = []
-    for photo in photos:
-        data = await photo.read()
-        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if img is None:
-            continue
-        faces = pipeline.detector.detect(img)
-        if not faces:
-            continue
-        aligned = pipeline.detector.align_face(img, faces[0])
-        emb = pipeline.recognizer.get_embedding(aligned)
-        if emb is not None:
-            embeddings.append(emb)
-
-    if len(embeddings) < MIN_REGISTRATION_SAMPLES:
-        cursor.close(); conn.close()
-        return {
-            'success': False,
-            'error': (
-                f'Only {len(embeddings)} valid face samples found. '
-                f'Need at least {MIN_REGISTRATION_SAMPLES}.'
-            ),
-        }
-
-    cursor.execute(
-        'INSERT INTO students (name, roll_number, class_name, section) VALUES (%s, %s, %s, %s) RETURNING id',
-        (name, roll_number, class_name, section),
-    )
-    student_id = cursor.fetchone()[0]
-    conn.commit()
-    cursor.close(); conn.close()
-
-    avg = np.mean(embeddings, axis=0).astype(np.float32)
-    avg /= np.linalg.norm(avg)
-    store_embedding(student_id, avg, len(embeddings))
-
-    return {'success': True, 'student_id': student_id, 'samples_used': len(embeddings)}
-
-
-# ─── Students ──────────────────────────────────────────────────────────────────
-@app.get('/api/students')
-def get_students(class_name: Optional[str] = None):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    query = ('SELECT id, name, roll_number, class_name, section, registered_at '
-             'FROM students WHERE is_active=TRUE')
-    params = []
-    if class_name:
-        query += ' AND class_name=%s'; params.append(class_name)
-    cursor.execute(query + ' ORDER BY name', params)
-    rows = [dict(r) for r in cursor.fetchall()]
-    for r in rows:
-        if r.get('registered_at'): r['registered_at'] = str(r['registered_at'])
-    cursor.close(); conn.close()
-    return rows
-
-
-@app.delete('/api/students/{student_id}')
-def delete_student(student_id: int):
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('UPDATE students SET is_active=FALSE WHERE id=%s', (student_id,))
-    conn.commit()
-    affected = cursor.rowcount
-    cursor.close(); conn.close()
-    if not affected:
-        raise HTTPException(status_code=404, detail='Student not found')
-    return {'success': True}
 
 
 if __name__ == '__main__':

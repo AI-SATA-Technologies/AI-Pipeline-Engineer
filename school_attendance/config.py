@@ -13,11 +13,13 @@ DB_NAME = os.getenv('DB_NAME', 'school_attendance')
 # Pipeline mode: 'lite' (MobileFaceNet, fast) or 'heavy' (ArcFace R50, accurate)
 MODE = os.getenv('MODE', 'heavy').lower()
 
-LIVENESS_MODEL_PATH = 'models/2.7_80x80_MiniFASNetV2.onnx'
-LIVENESS_THRESHOLD = float(os.getenv('LIVENESS_THRESHOLD', '0.60'))
 SIMILARITY_THRESHOLD = float(os.getenv('SIMILARITY_THRESHOLD', '0.40'))
 
 MIN_REGISTRATION_SAMPLES = int(os.getenv('MIN_REGISTRATION_SAMPLES', '5'))
 
 # LMS integration
 LMS_API_URL = os.getenv('LMS_API_URL', '')
+
+# Camera — integer index (e.g. 0) for webcam, or full URL for RTSP/HTTP
+_cam = os.getenv('CAMERA_URL', '')
+CAMERA_URL = int(_cam) if _cam.isdigit() else _cam

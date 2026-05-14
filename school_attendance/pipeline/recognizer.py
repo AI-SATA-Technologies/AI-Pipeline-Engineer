@@ -12,7 +12,7 @@ class FaceRecognizer:
       lite  -> w600k_mbf.onnx   (MobileFaceNet, 512-dim, ~5x faster)
 
     Produces L2-normalized 512-dim float32 vectors.
-    Similarity search is handled by pgvector in PostgreSQL — not here.
+    Similarity search is handled in-process by EmbeddingCache (numpy dot product).
     """
     _MODEL_PATHS = {
         'heavy': os.path.expanduser('~/.insightface/models/buffalo_l/w600k_r50.onnx'),
