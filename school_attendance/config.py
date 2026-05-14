@@ -3,12 +3,12 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-# PostgreSQL connection
+# MySQL connection
 DB_HOST = os.getenv('DB_HOST', 'localhost')
-DB_PORT = int(os.getenv('DB_PORT', '5432'))
-DB_USER = os.getenv('DB_USER', 'postgres')
+DB_PORT = int(os.getenv('DB_PORT', '3306'))
+DB_USER = os.getenv('DB_USER', 'root')
 DB_PASS = os.getenv('DB_PASS', '')
-DB_NAME = os.getenv('DB_NAME', 'school_attendance')
+DB_NAME = os.getenv('DB_NAME', 'lms_attendance')
 
 # Pipeline mode: 'lite' (MobileFaceNet, fast) or 'heavy' (ArcFace R50, accurate)
 MODE = os.getenv('MODE', 'heavy').lower()
