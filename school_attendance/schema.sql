@@ -17,16 +17,6 @@ CREATE TABLE IF NOT EXISTS students (
     is_active     BOOLEAN DEFAULT TRUE
 );
 
-CREATE TABLE IF NOT EXISTS attendance (
-    id         SERIAL PRIMARY KEY,
-    student_id INT NOT NULL REFERENCES students(id),
-    date       DATE NOT NULL,
-    marked_at  TIMESTAMP DEFAULT NOW(),
-    confidence FLOAT,
-    camera_id  VARCHAR(50),
-    UNIQUE (student_id, date)
-);
-
 -- One averaged 512-dim float32 embedding per student stored as raw bytes.
 -- UNIQUE(student_id) lets re-registration update the existing row cleanly.
 CREATE TABLE IF NOT EXISTS embeddings (
@@ -35,4 +25,13 @@ CREATE TABLE IF NOT EXISTS embeddings (
     created_at   TIMESTAMP DEFAULT NOW(),
     sample_count INT DEFAULT 0,
     vector       BYTEA NOT NULL
+);
+
+-- LMS-integrated students: store only the LMS-issued unique ID + embedding.
+-- No reference to the students table; student_id comes directly from the LMS.
+CREATE TABLE IF NOT EXISTS lms_embeddings (
+    lms_student_id VARCHAR(100) PRIMARY KEY,
+    created_at     TIMESTAMP DEFAULT NOW(),
+    sample_count   INT DEFAULT 0,
+    vector         BYTEA NOT NULL
 );

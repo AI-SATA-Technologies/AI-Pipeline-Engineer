@@ -18,3 +18,6 @@ LIVENESS_THRESHOLD = float(os.getenv('LIVENESS_THRESHOLD', '0.60'))
 SIMILARITY_THRESHOLD = float(os.getenv('SIMILARITY_THRESHOLD', '0.40'))
 
 MIN_REGISTRATION_SAMPLES = int(os.getenv('MIN_REGISTRATION_SAMPLES', '5'))
+
+# LMS integration
+LMS_API_URL = os.getenv('LMS_API_URL', '')

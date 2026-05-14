@@ -1,33 +1,39 @@
 import asyncio
-import io
-import csv
 import os
 import json
 import time
-from datetime import date as dt
+from contextlib import asynccontextmanager
+from datetime import datetime
 from typing import Optional
 
 import cv2
 import numpy as np
 import psycopg2.extras
+import requests
 from fastapi import FastAPI, File, UploadFile, Form, WebSocket, HTTPException, WebSocketDisconnect
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 
-from config import MODE, LIVENESS_MODEL_PATH, LIVENESS_THRESHOLD, MIN_REGISTRATION_SAMPLES
+from config import MODE, LIVENESS_MODEL_PATH, LIVENESS_THRESHOLD, MIN_REGISTRATION_SAMPLES, LMS_API_URL
 from database import (
     get_db_connection,
-    mark_attendance,
-    get_student_id_by_name,
-    identify_face,
+    embedding_cache,
     store_embedding,
+    store_lms_embedding,
     count_registered_students,
 )
 from pipeline.detector import FaceDetector
 from pipeline.liveness import LivenessDetector
 from pipeline.recognizer import FaceRecognizer
 
-app = FastAPI(title='School Face Attendance API', version='3.0')
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    count = await asyncio.to_thread(embedding_cache.load)
+    print(f'[cache] {count} student embedding(s) loaded into memory')
+    yield
+
+
+app = FastAPI(title='School Face Attendance API', version='3.0', lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=['*'], allow_methods=['*'], allow_headers=['*'])
 
 
@@ -48,11 +54,26 @@ if os.path.exists(LIVENESS_MODEL_PATH):
 
 
 def _identify(aligned: np.ndarray) -> tuple[str, float]:
-    """Get embedding then search pgvector."""
     emb = pipeline.recognizer.get_embedding(aligned)
     if emb is None:
         return 'Unknown', 0.0
-    return identify_face(emb)
+    return embedding_cache.search(emb)
+
+
+async def _notify_lms(student_id: str) -> None:
+    """POST detection event to the LMS API (non-blocking, errors are logged not raised)."""
+    if not LMS_API_URL:
+        return
+    payload = {
+        'student_id': student_id,
+        'detected_at': datetime.now().isoformat(timespec='seconds'),
+    }
+    try:
+        await asyncio.to_thread(
+            requests.post, LMS_API_URL, json=payload, timeout=5
+        )
+    except Exception as exc:
+        print(f'[lms] notify failed for {student_id}: {exc}')
 
 
 # ─── Status ───────────────────────────────────────────────────────────────────
@@ -104,10 +125,10 @@ async def camera_stream():
 @app.websocket('/ws/camera')
 async def camera_ws(websocket: WebSocket):
     """
-    WebSocket live feed with automatic attendance marking.
+    WebSocket live feed with automatic LMS notification on detection.
     Binary messages : JPEG frame bytes (render as video).
-    Text messages   : JSON attendance events.
-      {"type": "attendance", "name": "...", "status": "marked|already_marked", "confidence": 0.92}
+    Text messages   : JSON detection events.
+      {"type": "detection", "student_id": "...", "confidence": 0.92}
     """
     await websocket.accept()
     cap = cv2.VideoCapture(0, cv2.CAP_MSMF)
@@ -133,27 +154,25 @@ async def camera_ws(websocket: WebSocket):
             for face in pipeline.detector.detect(frame):
                 x1, y1, x2, y2 = face.bbox.astype(int)
                 aligned = pipeline.detector.align_face(frame, face)
-                name, conf = _identify(aligned)
-                color = (0, 255, 0) if name != 'Unknown' else (0, 165, 255)
+                student_id, conf = _identify(aligned)
+                color = (0, 255, 0) if student_id != 'Unknown' else (0, 165, 255)
                 cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
-                cv2.putText(frame, f'{name} {conf:.0%}', (x1, y1 - 10),
+                cv2.putText(frame, f'{student_id} {conf:.0%}', (x1, y1 - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
 
                 now = time.time()
-                if name != 'Unknown' and now - recent_marks.get(name, 0) > COOLDOWN:
-                    recent_marks[name] = now
-                    sid = get_student_id_by_name(name)
-                    if sid:
-                        marked = mark_attendance(sid, conf, 'ws_camera')
-                        try:
-                            await websocket.send_text(json.dumps({
-                                'type': 'attendance',
-                                'name': name,
-                                'status': 'marked' if marked else 'already_marked',
-                                'confidence': round(float(conf), 3),
-                            }))
-                        except Exception:
-                            pass
+                if student_id != 'Unknown' and now - recent_marks.get(student_id, 0) > COOLDOWN:
+                    recent_marks[student_id] = now
+                    await _notify_lms(student_id)
+                    embedding_cache.remove(student_id)
+                    try:
+                        await websocket.send_text(json.dumps({
+                            'type': 'detection',
+                            'student_id': student_id,
+                            'confidence': round(float(conf), 3),
+                        }))
+                    except Exception:
+                        pass
 
             _, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, 75])
             await websocket.send_bytes(buf.tobytes())
@@ -168,10 +187,9 @@ async def camera_ws(websocket: WebSocket):
 @app.post('/api/camera/process-frame')
 async def process_frame(
     file: UploadFile = File(...),
-    camera_id: str = Form('cam_01'),
 ):
     """
-    Submit a single JPEG frame. Returns detected faces and attendance results.
+    Submit a single JPEG frame. Notifies the LMS for each recognised face.
     Use for edge devices / IP cameras that send frames on their own schedule.
     """
     data = await file.read()
@@ -182,21 +200,80 @@ async def process_frame(
     results = []
     for face in pipeline.detector.detect(frame):
         aligned = pipeline.detector.align_face(frame, face)
-        name, confidence = _identify(aligned)
-        if name == 'Unknown':
+        student_id, confidence = _identify(aligned)
+        if student_id == 'Unknown':
             results.append({'status': 'unknown', 'confidence': round(confidence, 3)})
             continue
-        sid = get_student_id_by_name(name)
-        if sid is None:
-            results.append({'status': 'db_missing', 'name': name})
-            continue
-        marked = mark_attendance(sid, confidence, camera_id)
+        await _notify_lms(student_id)
+        embedding_cache.remove(student_id)
         results.append({
-            'name': name,
-            'status': 'marked' if marked else 'already_marked',
+            'student_id': student_id,
+            'status': 'notified',
             'confidence': round(confidence, 3),
         })
     return {'faces_detected': len(results), 'results': results}
+
+
+# ─── Register student (LMS integration) ───────────────────────────────────────
+@app.post('/api/register/lms')
+async def register_from_lms(
+    student_id: str = Form(...),
+    photos: list[UploadFile] = File(...),
+):
+    """
+    Register a student from the LMS.
+    Accepts the LMS-issued unique student_id and exactly 15 photos.
+    The ML pipeline only processes pixel data; student_id is stored as-is
+    and never passed to the face detector or recognizer.
+    """
+    if len(photos) != 15:
+        raise HTTPException(
+            status_code=400,
+            detail=f'Exactly 15 photos required, got {len(photos)}.',
+        )
+
+    embeddings = []
+    failed = 0
+    for photo in photos:
+        data = await photo.read()
+        img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
+        if img is None:
+            failed += 1
+            continue
+        faces = pipeline.detector.detect(img)
+        if not faces:
+            failed += 1
+            continue
+        aligned = pipeline.detector.align_face(img, faces[0])
+        emb = pipeline.recognizer.get_embedding(aligned)
+        if emb is not None:
+            embeddings.append(emb)
+        else:
+            failed += 1
+
+    if len(embeddings) < MIN_REGISTRATION_SAMPLES:
+        return {
+            'success': False,
+            'error': (
+                f'Only {len(embeddings)} valid face(s) extracted from {len(photos)} photos. '
+                f'Need at least {MIN_REGISTRATION_SAMPLES}.'
+            ),
+        }
+
+    avg = np.mean(embeddings, axis=0).astype(np.float32)
+    avg /= np.linalg.norm(avg)
+
+    # Persist to PostgreSQL — only student_id + embedding vector, never the images
+    store_lms_embedding(student_id, avg, len(embeddings))
+    # Mirror into the in-memory cache so detection is instant without a reload
+    embedding_cache.add(student_id, avg)
+
+    return {
+        'success': True,
+        'student_id': student_id,
+        'samples_used': len(embeddings),
+        'photos_failed': failed,
+    }
 
 
 # ─── Register student ──────────────────────────────────────────────────────────
@@ -289,95 +366,6 @@ def delete_student(student_id: int):
     if not affected:
         raise HTTPException(status_code=404, detail='Student not found')
     return {'success': True}
-
-
-# ─── Attendance ────────────────────────────────────────────────────────────────
-@app.get('/api/attendance')
-def get_attendance(date_str: Optional[str] = None, class_name: Optional[str] = None):
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-    query = '''
-        SELECT s.name, s.roll_number, s.class_name, s.section,
-               a.date, a.marked_at, a.confidence, a.camera_id
-        FROM attendance a
-        JOIN students s ON a.student_id = s.id
-        WHERE 1=1
-    '''
-    params = []
-    if date_str:
-        query += ' AND a.date=%s'; params.append(date_str)
-    if class_name:
-        query += ' AND s.class_name=%s'; params.append(class_name)
-    cursor.execute(query + ' ORDER BY a.marked_at DESC', params)
-    rows = [dict(r) for r in cursor.fetchall()]
-    for r in rows:
-        if r.get('date'): r['date'] = str(r['date'])
-        if r.get('marked_at'): r['marked_at'] = str(r['marked_at'])
-    cursor.close(); conn.close()
-    return rows
-
-
-@app.get('/api/attendance/export')
-def export_attendance(date_str: str):
-    rows = get_attendance(date_str)
-    output = io.StringIO()
-    if rows:
-        writer = csv.DictWriter(output, fieldnames=rows[0].keys())
-        writer.writeheader(); writer.writerows(rows)
-    output.seek(0)
-    return StreamingResponse(
-        output, media_type='text/csv',
-        headers={'Content-Disposition': f'attachment; filename=attendance_{date_str}.csv'},
-    )
-
-
-# ─── Statistics ────────────────────────────────────────────────────────────────
-@app.get('/api/stats')
-def get_stats(date_str: Optional[str] = None, class_name: Optional[str] = None):
-    """Attendance summary for a date (defaults to today). Includes per-class breakdown."""
-    target_date = date_str or str(dt.today())
-    conn = get_db_connection()
-    cursor = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-
-    q_total = 'SELECT COUNT(*) AS total FROM students WHERE is_active=TRUE'
-    p_total: list = []
-    if class_name:
-        q_total += ' AND class_name=%s'; p_total.append(class_name)
-    cursor.execute(q_total, p_total)
-    total = cursor.fetchone()['total']
-
-    q_present = '''
-        SELECT COUNT(DISTINCT a.student_id) AS present
-        FROM attendance a JOIN students s ON a.student_id = s.id
-        WHERE a.date=%s AND s.is_active=TRUE
-    '''
-    p_present = [target_date]
-    if class_name:
-        q_present += ' AND s.class_name=%s'; p_present.append(class_name)
-    cursor.execute(q_present, p_present)
-    present = cursor.fetchone()['present']
-
-    cursor.execute('''
-        SELECT s.class_name,
-               COUNT(DISTINCT s.id)          AS total,
-               COUNT(DISTINCT a.student_id)  AS present
-        FROM students s
-        LEFT JOIN attendance a ON s.id = a.student_id AND a.date=%s
-        WHERE s.is_active=TRUE
-        GROUP BY s.class_name ORDER BY s.class_name
-    ''', [target_date])
-    by_class = [dict(r) for r in cursor.fetchall()]
-
-    cursor.close(); conn.close()
-    absent = total - present
-    return {
-        'date': target_date,
-        'total_students': total,
-        'present': present,
-        'absent': absent,
-        'attendance_rate': round(present / total * 100, 1) if total else 0.0,
-        'by_class': by_class,
-    }
 
 
 if __name__ == '__main__':

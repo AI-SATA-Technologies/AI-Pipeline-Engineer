@@ -22,7 +22,7 @@
 ![FastAPI](https://img.shields.io/badge/fastapi-0.136-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![InsightFace](https://img.shields.io/badge/insightface-buffalo__l-ff5c00?style=flat-square)
 ![FAISS](https://img.shields.io/badge/faiss-cpu-005f9e?style=flat-square)
-![MySQL](https://img.shields.io/badge/mysql-8.4-4479A1?style=flat-square&logo=mysql&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/postgresql-16-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/license-internal-1c1c1c?style=flat-square)
 
 </div>
@@ -290,7 +290,7 @@ erDiagram
 | **Recognition** | ArcFace R50 / MobileFaceNet (ONNX Runtime) | 512-d embeddings |
 | **Anti-spoof** | MiniFASNetV2 (ONNX) | Passive liveness score |
 | **Search** | FAISS `IndexFlatIP` | Cosine similarity over normalized embeddings |
-| **Storage** | MySQL 8.4 + `mysql-connector-python` | Students · attendance · embedding metadata |
+| **Storage** | PostgreSQL 16 + `psycopg2-binary` | Students · attendance · embedding metadata |
 | **Image I/O** | OpenCV 4.9 · NumPy 1.26 · Pillow 12 | Decode, align, encode JPEG |
 | **Frontend** | Vanilla HTML + WebSocket + CSS | Zero build step |
 
@@ -303,7 +303,7 @@ AI Pipeline Engineer/
 └── school_attendance/
     ├── main.py                    ← FastAPI app + WebSocket endpoints
     ├── config.py                  ← env vars, MODE, faiss_paths()
-    ├── database.py                ← MySQL connection factory
+    ├── database.py                ← PostgreSQL connection factory (psycopg2)
     ├── schema.sql                 ← students · attendance · embeddings
     ├── requirements.txt
     │
@@ -329,7 +329,7 @@ AI Pipeline Engineer/
     │   └── 2.7_80x80_MiniFASNetV2.onnx
     │
     ├── start.bat                  ← One-shot launcher (Windows)
-    ├── start_mysql.bat            ← Boots local mysqld if not running
+    ├── start_mysql.bat            ← Legacy helper (MySQL era — not used)
     ├── stop_all.bat
     └── camera_client.py           ← Optional remote-camera client
 ```
@@ -338,7 +338,7 @@ AI Pipeline Engineer/
 
 ## ❍ &nbsp; Setup On Another PC
 
-> Tested on **Windows 11 / Python 3.11 / MySQL 8.4**. Linux works with minor
+> Tested on **Windows 11 / Python 3.11 / PostgreSQL 16**. Linux works with minor
 > path edits.
 
 ### 1 · Prerequisites
@@ -346,7 +346,7 @@ AI Pipeline Engineer/
 | Tool | Version | Notes |
 |------|---------|-------|
 | Python | **3.11** | InsightFace wheel is `cp311` — do not skip |
-| MySQL Server | 8.x | Port 3306 default |
+| PostgreSQL | **16.x** | Port 5432 default |
 | Git | any | |
 | Webcam | any | Built-in or USB |
 
@@ -388,10 +388,10 @@ This populates:
 ~/.insightface/models/buffalo_sc/  →  w600k_mbf.onnx + det_500m.onnx
 ```
 
-### 5 · MySQL
+### 5 · PostgreSQL
 
 ```sql
-mysql -u root -p < schema.sql
+psql -U postgres -f schema.sql
 ```
 
 ### 6 · `.env`
@@ -400,8 +400,9 @@ Create `school_attendance/.env`:
 
 ```env
 DB_HOST=localhost
-DB_USER=root
-DB_PASS=your_password
+DB_PORT=5432
+DB_USER=postgres
+DB_PASS=your_postgres_password
 DB_NAME=school_attendance
 
 MODE=heavy
@@ -436,7 +437,7 @@ Then open:
 | `SIMILARITY_THRESHOLD` | `0.40` | Cosine score below this → `Unknown` |
 | `MIN_REGISTRATION_SAMPLES` | `5` | Photos that must yield a valid embedding |
 | `CAMERA_INTERVAL` | `5` | Frame interval for the optional `camera_client.py` |
-| `DB_*` | — | MySQL credentials |
+| `DB_*` | — | PostgreSQL credentials (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`) |
 
 ---
 
@@ -482,7 +483,7 @@ Then open:
 |---------|-------|-----|
 | `Only 0 valid face samples found` | Faces not detected in upload | Use bright photos, single face, looking ahead |
 | `Unknown` returned for known student | Liveness blocking, threshold too high, or wrong mode | Check `/api/status`; verify the right index has the student |
-| `mysql.connector.errors.InterfaceError: 2003` | MySQL not running | Run `start_mysql.bat` first |
+| `psycopg2.OperationalError: could not connect to server` | PostgreSQL not running | Start PostgreSQL service (`pg_ctl start` or Services panel) |
 | Cold start very slow | ONNX models downloading | One-time; see step 4 above |
 | Verify modal stuck on "Connecting…" | Webcam in use elsewhere | Close Zoom/Teams/Chrome tabs holding the camera |
 

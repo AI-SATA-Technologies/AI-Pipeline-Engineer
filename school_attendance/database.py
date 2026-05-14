@@ -1,4 +1,4 @@
-from datetime import date
+import threading
 
 import numpy as np
 import psycopg2
@@ -15,38 +15,129 @@ def get_db_connection():
     )
 
 
-# ─── Attendance ────────────────────────────────────────────────────────────────
+# ─── In-memory embedding cache ────────────────────────────────────────────────
 
-def mark_attendance(student_id: int, confidence: float, camera_id: str) -> bool:
-    """Insert today's attendance. Returns True if newly marked."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    try:
-        cursor.execute(
-            '''INSERT INTO attendance (student_id, date, confidence, camera_id)
-               VALUES (%s, %s, %s, %s)
-               ON CONFLICT (student_id, date) DO NOTHING''',
-            (student_id, date.today(), confidence, camera_id),
-        )
-        conn.commit()
-        return cursor.rowcount > 0
-    finally:
+class EmbeddingCache:
+    """
+    Thread-safe in-memory store of all student embeddings.
+
+    PostgreSQL is the source of truth; this cache serves every detection query
+    with zero DB I/O.  Layout:
+        _ids    — ordered list of lms_student_id strings
+        _matrix — (N, 512) float32 array; row i corresponds to _ids[i]
+
+    Cosine similarity reduces to a dot product because both the stored vectors
+    and the query are L2-normalised before they reach this class.
+    """
+
+    def __init__(self):
+        self._ids: list[str] = []
+        self._matrix = np.empty((0, 512), dtype=np.float32)
+        self._lock = threading.Lock()
+
+    # ── Lifecycle ──────────────────────────────────────────────────────────────
+
+    def load(self) -> int:
+        """Load (or reload) all embeddings from PostgreSQL. Returns record count."""
+        conn = get_db_connection()
+        cursor = conn.cursor()
+        cursor.execute('SELECT lms_student_id, vector FROM lms_embeddings')
+        rows = cursor.fetchall()
         cursor.close(); conn.close()
 
+        ids, vecs = [], []
+        for lms_id, vec_bytes in rows:
+            ids.append(lms_id)
+            vecs.append(np.frombuffer(bytes(vec_bytes), dtype=np.float32).copy())
 
-def get_student_id_by_name(name: str) -> int | None:
+        with self._lock:
+            self._ids = ids
+            self._matrix = (
+                np.stack(vecs).astype(np.float32)
+                if vecs else np.empty((0, 512), dtype=np.float32)
+            )
+        return len(ids)
+
+    # ── Write ──────────────────────────────────────────────────────────────────
+
+    def add(self, lms_student_id: str, embedding: np.ndarray) -> None:
+        """Insert or update a student's L2-normalised embedding in the cache."""
+        vec = embedding.astype(np.float32)
+        with self._lock:
+            if lms_student_id in self._ids:
+                self._matrix[self._ids.index(lms_student_id)] = vec
+            else:
+                self._ids.append(lms_student_id)
+                self._matrix = (
+                    np.vstack([self._matrix, vec.reshape(1, 512)])
+                    if self._matrix.shape[0] else vec.reshape(1, 512)
+                )
+
+    def remove(self, lms_student_id: str) -> None:
+        """Evict a student from RAM after their attendance is marked."""
+        with self._lock:
+            if lms_student_id not in self._ids:
+                return
+            idx = self._ids.index(lms_student_id)
+            self._ids.pop(idx)
+            self._matrix = np.delete(self._matrix, idx, axis=0)
+
+    # ── Read ───────────────────────────────────────────────────────────────────
+
+    def search(self, query: np.ndarray) -> tuple[str, float]:
+        """
+        Cosine similarity search via matrix dot-product (no DB I/O).
+        Returns (lms_student_id, score) or ('Unknown', score) if below threshold.
+        Score range: -1.0 to 1.0  (1.0 = identical).
+        """
+        with self._lock:
+            if self._matrix.shape[0] == 0:
+                return 'Unknown', 0.0
+            scores = self._matrix @ query.astype(np.float32)   # (N,)
+            best_idx = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
+            best_id = self._ids[best_idx]
+
+        if best_score >= SIMILARITY_THRESHOLD:
+            return best_id, best_score
+        return 'Unknown', best_score
+
+    def __len__(self) -> int:
+        with self._lock:
+            return len(self._ids)
+
+
+embedding_cache = EmbeddingCache()
+
+
+# ─── LMS embedding storage ─────────────────────────────────────────────────────
+
+def store_lms_embedding(lms_student_id: str, embedding: np.ndarray, sample_count: int) -> None:
+    """
+    Persist the embedding to PostgreSQL.
+    Only the 512-dim float32 vector and the LMS student ID are written to the DB.
+    Source images are processed in memory and never stored anywhere.
+    Call embedding_cache.add() after this to keep the cache current without a reload.
+    """
+    vec_bytes = embedding.astype(np.float32).tobytes()
     conn = get_db_connection()
     cursor = conn.cursor()
-    cursor.execute('SELECT id FROM students WHERE name=%s AND is_active=TRUE', (name,))
-    row = cursor.fetchone()
+    cursor.execute(
+        '''INSERT INTO lms_embeddings (lms_student_id, sample_count, vector)
+           VALUES (%s, %s, %s)
+           ON CONFLICT (lms_student_id) DO UPDATE
+               SET vector       = EXCLUDED.vector,
+                   sample_count = EXCLUDED.sample_count,
+                   created_at   = NOW()''',
+        (lms_student_id, sample_count, psycopg2.Binary(vec_bytes)),
+    )
+    conn.commit()
     cursor.close(); conn.close()
-    return row[0] if row else None
 
 
-# ─── Embedding storage ─────────────────────────────────────────────────────────
+# ─── Legacy embedding storage (original /api/register flow) ───────────────────
 
 def store_embedding(student_id: int, embedding: np.ndarray, sample_count: int) -> None:
-    """Store a student's averaged 512-dim float32 embedding as raw bytes (BYTEA)."""
     vec_bytes = embedding.astype(np.float32).tobytes()
     conn = get_db_connection()
     cursor = conn.cursor()
@@ -63,64 +154,7 @@ def store_embedding(student_id: int, embedding: np.ndarray, sample_count: int) -
     cursor.close(); conn.close()
 
 
-def _load_all_embeddings() -> list[tuple[str, np.ndarray]]:
-    """Load all active students' embeddings from DB into memory for search."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''SELECT s.name, e.vector
-           FROM embeddings e
-           JOIN students s ON e.student_id = s.id
-           WHERE s.is_active = TRUE'''
-    )
-    rows = cursor.fetchall()
-    cursor.close(); conn.close()
-    result = []
-    for name, vec_bytes in rows:
-        vec = np.frombuffer(bytes(vec_bytes), dtype=np.float32).copy()
-        result.append((name, vec))
-    return result
-
-
-# ─── Vector search (numpy cosine similarity) ──────────────────────────────────
-
-def identify_face(embedding: np.ndarray) -> tuple[str, float]:
-    """
-    Cosine similarity search using numpy over all stored embeddings.
-    No PostgreSQL extension required.
-    Returns (student_name, score) or ('Unknown', score) if below threshold.
-    Score range: -1.0 to 1.0  (1.0 = identical)
-    Suitable for up to ~10,000 students at real-time speed.
-    """
-    records = _load_all_embeddings()
-    if not records:
-        return 'Unknown', 0.0
-
-    names = [r[0] for r in records]
-    matrix = np.stack([r[1] for r in records])          # (N, 512)
-    query = embedding.astype(np.float32)
-
-    # Cosine similarity = dot product (both sides are L2-normalized)
-    scores = matrix @ query                              # (N,)
-    best_idx = int(np.argmax(scores))
-    best_score = float(scores[best_idx])
-
-    if best_score >= SIMILARITY_THRESHOLD:
-        return names[best_idx], best_score
-    return 'Unknown', best_score
-
-
 # ─── Count ────────────────────────────────────────────────────────────────────
 
 def count_registered_students() -> int:
-    """Count active students who have a stored embedding."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''SELECT COUNT(*) FROM embeddings e
-           JOIN students s ON e.student_id = s.id
-           WHERE s.is_active = TRUE'''
-    )
-    count = cursor.fetchone()[0]
-    cursor.close(); conn.close()
-    return count
+    return len(embedding_cache)
