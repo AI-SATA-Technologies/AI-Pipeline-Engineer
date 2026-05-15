@@ -212,60 +212,57 @@ async def process_frame(
 # ─── Register student (LMS integration) ───────────────────────────────────────
 @app.post('/api/register/lms')
 async def register_from_lms(
-    student_id: str = Form(...),
-    photos: list[UploadFile] = File(...),
+    registration_number: str = Form(...),
+    photos: list[UploadFile] = File(..., alias='photos[]'),
 ):
     """
     Register a student from the LMS.
-    Accepts the LMS-issued unique student_id and exactly 15 photos.
-    The ML pipeline only processes pixel data; student_id is stored as-is
-    and never passed to the face detector or recognizer.
+    Requires exactly 15 images in a single array (key: photos[]).
+    At least 7 must contain a detectable face — blurry or faceless images
+    are skipped automatically. Returns status 1 on success, 0 on failure.
     """
-    if len(photos) != 15:
-        raise HTTPException(
-            status_code=400,
-            detail=f'Exactly 15 photos required, got {len(photos)}.',
-        )
+    REQUIRED_UPLOAD = 15
+    REQUIRED_VALID  = 7
+
+    if len(photos) != REQUIRED_UPLOAD:
+        return {
+            'success': False,
+            'status': 0,
+            'message': f'Exactly {REQUIRED_UPLOAD} photos required, received {len(photos)}',
+        }
 
     embeddings = []
-    failed = 0
-    for photo in photos:
-        data = await photo.read()
+    for image in photos:
+        data = await image.read()
         img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
         if img is None:
-            failed += 1
             continue
         faces = pipeline.detector.detect(img)
         if not faces:
-            failed += 1
             continue
         aligned = pipeline.detector.align_face(img, faces[0])
         emb = pipeline.recognizer.get_embedding(aligned)
         if emb is not None:
             embeddings.append(emb)
-        else:
-            failed += 1
 
-    if len(embeddings) < MIN_REGISTRATION_SAMPLES:
+    if len(embeddings) < REQUIRED_VALID:
         return {
             'success': False,
-            'error': (
-                f'Only {len(embeddings)} valid face(s) extracted from {len(photos)} photos. '
-                f'Need at least {MIN_REGISTRATION_SAMPLES}.'
-            ),
+            'status': 0,
+            'message': f'Only {len(embeddings)} photo(s) had a detectable face, '
+                       f'at least {REQUIRED_VALID} required',
         }
 
     avg = np.mean(embeddings, axis=0).astype(np.float32)
     avg /= np.linalg.norm(avg)
 
-    store_lms_embedding(student_id, avg, len(embeddings))
-    embedding_cache.add(student_id, avg)
+    store_lms_embedding(registration_number, avg, len(embeddings))
+    embedding_cache.add(registration_number, avg)
 
     return {
         'success': True,
-        'student_id': student_id,
-        'samples_used': len(embeddings),
-        'photos_failed': failed,
+        'status': 1,
+        'message': 'Face registered successfully',
     }
 
 
