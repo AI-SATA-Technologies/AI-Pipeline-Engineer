@@ -1,8 +1,6 @@
 import asyncio
-import time
 from contextlib import asynccontextmanager
 from datetime import datetime
-from typing import Optional
 
 import cv2
 import numpy as np
@@ -10,8 +8,13 @@ import requests
 from fastapi import FastAPI, File, UploadFile, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 
-from config import MODE, MIN_REGISTRATION_SAMPLES, LMS_API_URL, CAMERA_URL
-from database import embedding_cache, store_lms_embedding
+from config import MODE, MIN_REGISTRATION_SAMPLES, LMS_API_URL
+from database import (
+    embedding_cache,
+    store_lms_embedding,
+    registration_exists,
+    find_matching_student,
+)
 from pipeline.detector import FaceDetector
 from pipeline.recognizer import FaceRecognizer
 
@@ -36,12 +39,12 @@ def _identify(aligned: np.ndarray) -> tuple[str, float]:
     return embedding_cache.search(emb)
 
 
-async def _notify_lms(student_id: str) -> None:
+async def _notify_lms(registration_number: str) -> None:
     """POST detection event to the LMS API (non-blocking, errors are logged not raised)."""
     if not LMS_API_URL:
         return
     payload = {
-        'student_id': student_id,
+        'registration_number': registration_number,
         'detected_at': datetime.now().isoformat(timespec='seconds'),
     }
     try:
@@ -49,84 +52,7 @@ async def _notify_lms(student_id: str) -> None:
             requests.post, LMS_API_URL, json=payload, timeout=5
         )
     except Exception as exc:
-        print(f'[lms] notify failed for {student_id}: {exc}')
-
-
-def _process_frame_sync(frame: np.ndarray) -> list[tuple[str, float]]:
-    """Detect and identify all known faces in one frame. Runs in a thread pool."""
-    out = []
-    for face in pipeline.detector.detect(frame):
-        aligned = pipeline.detector.align_face(frame, face)
-        student_id, conf = _identify(aligned)
-        if student_id != 'Unknown':
-            out.append((student_id, conf))
-    return out
-
-
-# ─── Camera background task ───────────────────────────────────────────────────
-
-_camera_state: dict = {'running': False, 'connected': False}
-
-
-async def _camera_loop() -> None:
-    """
-    Connects to CAMERA_URL and processes every frame indefinitely.
-    Auto-reconnects on stream loss. Runs for the full server lifetime.
-    """
-    RECONNECT_DELAY = 5.0
-    COOLDOWN = 30.0
-    recent_marks: dict[str, float] = {}
-    cap: Optional[cv2.VideoCapture] = None
-    miss = 0
-
-    _camera_state['running'] = True
-    try:
-        while True:
-            if cap is None or not cap.isOpened():
-                _camera_state['connected'] = False
-                print(f'[camera] connecting -> {CAMERA_URL}')
-                cap = await asyncio.to_thread(lambda: cv2.VideoCapture(CAMERA_URL))
-                if not cap.isOpened():
-                    print(f'[camera] connection failed, retry in {RECONNECT_DELAY}s')
-                    cap = None
-                    await asyncio.sleep(RECONNECT_DELAY)
-                    continue
-                miss = 0
-                _camera_state['connected'] = True
-                print('[camera] connected')
-
-            ret, frame = await asyncio.to_thread(cap.read)
-            if not ret:
-                miss += 1
-                if miss >= 10:
-                    print('[camera] stream lost, reconnecting')
-                    cap.release()
-                    cap = None
-                    await asyncio.sleep(RECONNECT_DELAY)
-                else:
-                    await asyncio.sleep(0.05)
-                continue
-            miss = 0
-
-            detections = await asyncio.to_thread(_process_frame_sync, frame)
-            now = time.time()
-            for student_id, conf in detections:
-                if now - recent_marks.get(student_id, 0) > COOLDOWN:
-                    recent_marks[student_id] = now
-                    await _notify_lms(student_id)
-                    embedding_cache.remove(student_id)
-                    print(f'[camera] marked {student_id} ({conf:.1%})')
-
-            await asyncio.sleep(0)
-
-    except asyncio.CancelledError:
-        pass
-    finally:
-        _camera_state['running'] = False
-        _camera_state['connected'] = False
-        if cap and cap.isOpened():
-            cap.release()
-        print('[camera] background task stopped')
+        print(f'[lms] notify failed for {registration_number}: {exc}')
 
 
 # ─── App + Lifespan ───────────────────────────────────────────────────────────
@@ -135,22 +61,7 @@ async def _camera_loop() -> None:
 async def lifespan(_: FastAPI):
     count = await asyncio.to_thread(embedding_cache.load)
     print(f'[cache] {count} student embedding(s) loaded into memory')
-
-    cam_task = None
-    if CAMERA_URL != '' and CAMERA_URL is not None:
-        cam_task = asyncio.create_task(_camera_loop())
-        print(f'[camera] background task started -> {CAMERA_URL}')
-    else:
-        print('[camera] CAMERA_URL not set — background task disabled')
-
     yield
-
-    if cam_task:
-        cam_task.cancel()
-        try:
-            await cam_task
-        except asyncio.CancelledError:
-            pass
 
 
 app = FastAPI(title='School Face Attendance API', version='3.0', lifespan=lifespan)
@@ -167,46 +78,43 @@ def status():
     }
 
 
-# ─── Camera status ────────────────────────────────────────────────────────────
-@app.get('/api/camera/status')
-def camera_status():
-    return {
-        'task_running': _camera_state['running'],
-        'connected': _camera_state['connected'],
-        'url_configured': CAMERA_URL != '' and CAMERA_URL is not None,
-        'students_pending': len(embedding_cache),
-    }
-
-
 # ─── Process single frame ──────────────────────────────────────────────────────
 @app.post('/api/camera/process-frame')
 async def process_frame(
     file: UploadFile = File(...),
 ):
     """
-    Submit a single JPEG frame. Notifies the LMS for each recognised face.
-    Use for edge devices / IP cameras that push frames on their own schedule.
+    Submit a single JPEG frame / image. Notifies the LMS for each recognised
+    face and returns the registration number and detection time. Used by
+    viewer.py and for manual image-upload testing.
     """
     data = await file.read()
     frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
     if frame is None:
         raise HTTPException(status_code=400, detail='Invalid image data')
 
+    detected_at = datetime.now().isoformat(timespec='seconds')
     results = []
     for face in pipeline.detector.detect(frame):
         aligned = pipeline.detector.align_face(frame, face)
-        student_id, confidence = _identify(aligned)
-        if student_id == 'Unknown':
-            results.append({'status': 'unknown', 'confidence': round(confidence, 3)})
+        registration_number, _ = _identify(aligned)
+        if registration_number == 'Unknown':
+            results.append({
+                'status': 'unknown',
+            })
             continue
-        await _notify_lms(student_id)
-        embedding_cache.remove(student_id)
+        await _notify_lms(registration_number)
+        embedding_cache.remove(registration_number)
         results.append({
-            'student_id': student_id,
+            'registration_number': registration_number,
             'status': 'notified',
-            'confidence': round(confidence, 3),
+            'detected_at': detected_at,
         })
-    return {'faces_detected': len(results), 'results': results}
+    return {
+        'faces_detected': len(results),
+        'detected_at': detected_at,
+        'results': results,
+    }
 
 
 # ─── Register student (LMS integration) ───────────────────────────────────────
@@ -220,6 +128,9 @@ async def register_from_lms(
     Requires exactly 15 images in a single array (key: photos[]).
     At least 7 must contain a detectable face — blurry or faceless images
     are skipped automatically. Returns status 1 on success, 0 on failure.
+
+    Rejects the request if the registration_number is already registered,
+    or if the submitted face is already registered under another number.
     """
     REQUIRED_UPLOAD = 15
     REQUIRED_VALID  = 7
@@ -229,6 +140,13 @@ async def register_from_lms(
             'success': False,
             'status': 0,
             'message': f'Exactly {REQUIRED_UPLOAD} photos required, received {len(photos)}',
+        }
+
+    if registration_exists(registration_number):
+        return {
+            'success': False,
+            'status': 0,
+            'message': f'registration_number {registration_number} is already registered',
         }
 
     embeddings = []
@@ -255,6 +173,14 @@ async def register_from_lms(
 
     avg = np.mean(embeddings, axis=0).astype(np.float32)
     avg /= np.linalg.norm(avg)
+
+    existing, _ = find_matching_student(avg)
+    if existing is not None:
+        return {
+            'success': False,
+            'status': 0,
+            'message': f'This face is already registered under registration_number {existing}',
+        }
 
     store_lms_embedding(registration_number, avg, len(embeddings))
     embedding_cache.add(registration_number, avg)

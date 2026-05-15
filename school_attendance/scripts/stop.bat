@@ -16,5 +16,10 @@ if "%FOUND%"=="0" (
 ) else (
     echo Server stopped.
 )
+
+echo.
+echo Closing camera viewer (viewer.py) if running...
+powershell -NoProfile -Command "Get-CimInstance Win32_Process | Where-Object { $_.Name -eq 'python.exe' -and $_.CommandLine -like '*viewer.py*' } | ForEach-Object { Stop-Process -Id $_.ProcessId -Force; Write-Host ('Viewer closed (PID ' + $_.ProcessId + ')') }"
+
 echo.
 pause
