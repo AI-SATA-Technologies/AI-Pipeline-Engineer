@@ -1,66 +1,111 @@
+import logging
 import threading
+from contextlib import contextmanager
 
 import numpy as np
 import psycopg2
+from psycopg2 import pool
 
-from config import DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME, SIMILARITY_THRESHOLD
+from config import (
+    DB_HOST, DB_PORT, DB_USER, DB_PASS, DB_NAME,
+    DB_POOL_MIN, DB_POOL_MAX, SIMILARITY_THRESHOLD,
+)
+
+logger = logging.getLogger('attendance.db')
+
+EMBED_DIM = 512
 
 
-def get_db_connection():
-    return psycopg2.connect(
-        host=DB_HOST, port=DB_PORT,
-        user=DB_USER, password=DB_PASS,
-        dbname=DB_NAME,
+class StorageError(RuntimeError):
+    """Raised when the database is unavailable or a query fails."""
+
+
+# ─── Connection pool ────────────────────────────────────────────────────────
+
+_pool: pool.ThreadedConnectionPool | None = None
+_pool_lock = threading.Lock()
+
+
+def _get_pool() -> pool.ThreadedConnectionPool:
+    global _pool
+    if _pool is None:
+        with _pool_lock:
+            if _pool is None:
+                try:
+                    _pool = pool.ThreadedConnectionPool(
+                        DB_POOL_MIN, DB_POOL_MAX,
+                        host=DB_HOST, port=DB_PORT,
+                        user=DB_USER, password=DB_PASS, dbname=DB_NAME,
+                    )
+                    logger.info('PostgreSQL pool ready (%s-%s connections)', DB_POOL_MIN, DB_POOL_MAX)
+                except psycopg2.Error as exc:
+                    raise StorageError(f'cannot connect to PostgreSQL: {exc}') from exc
+    return _pool
+
+
+@contextmanager
+def get_conn():
+    """Borrow a pooled connection; rolls back and wraps DB errors as StorageError."""
+    pool_ = _get_pool()
+    conn = None
+    try:
+        conn = pool_.getconn()
+        yield conn
+    except psycopg2.Error as exc:
+        if conn is not None:
+            conn.rollback()
+        raise StorageError(str(exc)) from exc
+    finally:
+        if conn is not None:
+            pool_.putconn(conn)
+
+
+# ─── Embedding (de)serialization ────────────────────────────────────────────
+
+def _fetch_all_embeddings() -> list[tuple[str, memoryview]]:
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute('SELECT registration_number, vector FROM student_face_embeddings')
+        rows = cur.fetchall()
+        cur.close()
+    return rows
+
+
+def _rows_to_matrix(rows) -> tuple[list[str], np.ndarray]:
+    ids, vecs = [], []
+    for reg, vec_bytes in rows:
+        ids.append(reg)
+        vecs.append(np.frombuffer(bytes(vec_bytes), dtype=np.float32).copy())
+    matrix = (
+        np.stack(vecs).astype(np.float32) if vecs
+        else np.empty((0, EMBED_DIM), dtype=np.float32)
     )
+    return ids, matrix
 
 
-# ─── In-memory embedding cache ────────────────────────────────────────────────
+# ─── In-memory vector stores ──────────────────────────────────────────────────
 
-class EmbeddingCache:
-    """
-    Thread-safe in-memory store of all student embeddings.
+class _VectorStore:
+    """Thread-safe in-memory (N, 512) float32 store keyed by registration_number.
 
-    PostgreSQL is the source of truth; this cache serves every detection query
-    with zero DB I/O.  Layout:
-        _ids    — ordered list of registration_number strings
-        _matrix — (N, 512) float32 array; row i corresponds to _ids[i]
-
-    Cosine similarity reduces to a dot product because both the stored vectors
-    and the query are L2-normalised before they reach this class.
+    PostgreSQL is the source of truth; both stored vectors and queries are
+    L2-normalised, so cosine similarity reduces to a dot product.
     """
 
     def __init__(self):
         self._ids: list[str] = []
-        self._matrix = np.empty((0, 512), dtype=np.float32)
+        self._matrix = np.empty((0, EMBED_DIM), dtype=np.float32)
         self._lock = threading.Lock()
-
-    # ── Lifecycle ──────────────────────────────────────────────────────────────
 
     def load(self) -> int:
         """Load (or reload) all embeddings from PostgreSQL. Returns record count."""
-        conn = get_db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT registration_number, vector FROM student_face_embeddings')
-        rows = cursor.fetchall()
-        cursor.close(); conn.close()
-
-        ids, vecs = [], []
-        for lms_id, vec_bytes in rows:
-            ids.append(lms_id)
-            vecs.append(np.frombuffer(bytes(vec_bytes), dtype=np.float32).copy())
-
+        ids, matrix = _rows_to_matrix(_fetch_all_embeddings())
         with self._lock:
-            self._ids = ids
-            self._matrix = (
-                np.stack(vecs).astype(np.float32)
-                if vecs else np.empty((0, 512), dtype=np.float32)
-            )
+            self._ids, self._matrix = ids, matrix
         return len(ids)
 
-    # ── Write ──────────────────────────────────────────────────────────────────
-
     def add(self, registration_number: str, embedding: np.ndarray) -> None:
-        """Insert or update a student's L2-normalised embedding in the cache."""
+        """Insert or update an L2-normalised embedding."""
         vec = embedding.astype(np.float32)
         with self._lock:
             if registration_number in self._ids:
@@ -68,111 +113,103 @@ class EmbeddingCache:
             else:
                 self._ids.append(registration_number)
                 self._matrix = (
-                    np.vstack([self._matrix, vec.reshape(1, 512)])
-                    if self._matrix.shape[0] else vec.reshape(1, 512)
+                    np.vstack([self._matrix, vec.reshape(1, EMBED_DIM)])
+                    if self._matrix.shape[0] else vec.reshape(1, EMBED_DIM)
                 )
-
-    def remove(self, registration_number: str) -> None:
-        """Evict a student from RAM after their attendance is marked."""
-        with self._lock:
-            if registration_number not in self._ids:
-                return
-            idx = self._ids.index(registration_number)
-            self._ids.pop(idx)
-            self._matrix = np.delete(self._matrix, idx, axis=0)
-
-    # ── Read ───────────────────────────────────────────────────────────────────
-
-    def search(self, query: np.ndarray) -> tuple[str, float]:
-        """
-        Cosine similarity search via matrix dot-product (no DB I/O).
-        Returns (registration_number, score) or ('Unknown', score) if below threshold.
-        Score range: -1.0 to 1.0  (1.0 = identical).
-        """
-        with self._lock:
-            if self._matrix.shape[0] == 0:
-                return 'Unknown', 0.0
-            scores = self._matrix @ query.astype(np.float32)   # (N,)
-            best_idx = int(np.argmax(scores))
-            best_score = float(scores[best_idx])
-            best_id = self._ids[best_idx]
-
-        if best_score >= SIMILARITY_THRESHOLD:
-            return best_id, best_score
-        return 'Unknown', best_score
 
     def __len__(self) -> int:
         with self._lock:
             return len(self._ids)
 
 
+class EmbeddingCache(_VectorStore):
+    """Attendance cache. Students are evicted on detection (detect-once), so the
+    same person is reported to the LMS at most once per loaded session."""
+
+    def claim(self, query: np.ndarray) -> str | None:
+        """Atomically find the best match >= threshold and evict it.
+
+        Returns the registration_number if a student was claimed, else None.
+        Doing the match and eviction under one lock guarantees concurrent frames
+        cannot both claim (and double-notify) the same student.
+        """
+        q = query.astype(np.float32)
+        with self._lock:
+            if self._matrix.shape[0] == 0:
+                return None
+            scores = self._matrix @ q
+            best_idx = int(np.argmax(scores))
+            if float(scores[best_idx]) < SIMILARITY_THRESHOLD:
+                return None
+            best_id = self._ids.pop(best_idx)
+            self._matrix = np.delete(self._matrix, best_idx, axis=0)
+            return best_id
+
+
+class DedupIndex(_VectorStore):
+    """Permanent index of every registered face (never evicted). Used to reject
+    duplicate-face registrations without re-scanning the database each time."""
+
+    def find_match(self, embedding: np.ndarray) -> tuple[str | None, float]:
+        """Return (registration_number, score) of the best match >= threshold,
+        or (None, score) if no stored face matches."""
+        q = embedding.astype(np.float32)
+        with self._lock:
+            if self._matrix.shape[0] == 0:
+                return None, 0.0
+            scores = self._matrix @ q
+            best_idx = int(np.argmax(scores))
+            best_score = float(scores[best_idx])
+            best_id = self._ids[best_idx]
+        return (best_id, best_score) if best_score >= SIMILARITY_THRESHOLD else (None, best_score)
+
+
 embedding_cache = EmbeddingCache()
+dedup_index = DedupIndex()
 
 
-# ─── LMS embedding storage ─────────────────────────────────────────────────────
+# ─── Persistence ──────────────────────────────────────────────────────────────
 
 def store_lms_embedding(registration_number: str, embedding: np.ndarray, sample_count: int) -> None:
-    """
-    Persist the embedding to PostgreSQL.
-    Only the 512-dim float32 vector and the registration number are written to the DB.
-    Source images are processed in memory and never stored anywhere.
-    Call embedding_cache.add() after this to keep the cache current without a reload.
+    """Persist an embedding to PostgreSQL.
+
+    Only the 512-dim float32 vector + registration number are written. Source
+    images are processed in memory and never stored. Update the in-memory stores
+    (embedding_cache / dedup_index) afterwards to avoid a full reload.
     """
     vec_bytes = embedding.astype(np.float32).tobytes()
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        '''INSERT INTO student_face_embeddings (registration_number, sample_count, vector)
-           VALUES (%s, %s, %s)
-           ON CONFLICT (registration_number) DO UPDATE
-               SET vector       = EXCLUDED.vector,
-                   sample_count = EXCLUDED.sample_count,
-                   created_at   = NOW()''',
-        (registration_number, sample_count, psycopg2.Binary(vec_bytes)),
-    )
-    conn.commit()
-    cursor.close(); conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            '''INSERT INTO student_face_embeddings (registration_number, sample_count, vector)
+               VALUES (%s, %s, %s)
+               ON CONFLICT (registration_number) DO UPDATE
+                   SET vector       = EXCLUDED.vector,
+                       sample_count = EXCLUDED.sample_count,
+                       created_at   = NOW()''',
+            (registration_number, sample_count, psycopg2.Binary(vec_bytes)),
+        )
+        conn.commit()
+        cur.close()
 
 
 def registration_exists(registration_number: str) -> bool:
     """True if a student is already registered under this registration number."""
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute(
-        'SELECT 1 FROM student_face_embeddings WHERE registration_number = %s',
-        (registration_number,),
-    )
-    found = cursor.fetchone() is not None
-    cursor.close(); conn.close()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            'SELECT 1 FROM student_face_embeddings WHERE registration_number = %s',
+            (registration_number,),
+        )
+        found = cur.fetchone() is not None
+        cur.close()
     return found
 
 
 def find_matching_student(embedding: np.ndarray) -> tuple[str | None, float]:
+    """Find an already-registered face matching `embedding`.
+
+    Backed by the in-memory `dedup_index` (loaded at startup, updated on each
+    registration) — no per-call database scan.
     """
-    Search every stored embedding for a face matching `embedding`.
-    Returns (registration_number, score) of the best match at or above
-    SIMILARITY_THRESHOLD, or (None, score) if no stored face matches.
-
-    Scans the full DB on purpose — embedding_cache is emptied as attendance
-    is marked, so it cannot be used to detect already-registered faces.
-    """
-    conn = get_db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT registration_number, vector FROM student_face_embeddings')
-    rows = cursor.fetchall()
-    cursor.close(); conn.close()
-    if not rows:
-        return None, 0.0
-
-    ids = [r[0] for r in rows]
-    matrix = np.stack([
-        np.frombuffer(bytes(r[1]), dtype=np.float32) for r in rows
-    ]).astype(np.float32)
-    scores = matrix @ embedding.astype(np.float32)
-    best_idx = int(np.argmax(scores))
-    best_score = float(scores[best_idx])
-    if best_score >= SIMILARITY_THRESHOLD:
-        return ids[best_idx], best_score
-    return None, best_score
-
-
+    return dedup_index.find_match(embedding)
