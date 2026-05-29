@@ -22,12 +22,14 @@ import cv2
 import numpy as np
 import requests
 
-from config import MODE
+from config import MODE, API_KEY
 from pipeline.detector import FaceDetector
 
 SERVER_URL = 'http://127.0.0.1:8000/api/camera/process-frame'
 CAMERA_INDEX = 0
 JPEG_QUALITY = 80
+# Sent only when the server is configured with an API_KEY.
+HEADERS = {'X-API-Key': API_KEY} if API_KEY else {}
 
 
 def draw(frame, face, result):
@@ -80,6 +82,7 @@ def main():
                 resp = requests.post(
                     SERVER_URL,
                     files={'file': ('frame.jpg', jpeg, 'image/jpeg')},
+                    headers=HEADERS,
                     timeout=10,
                 )
                 if resp.status_code == 200:
