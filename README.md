@@ -15,13 +15,13 @@
 ╚══════════════════════════════════════════════════════════════════════════╝
 ```
 
-###### A real-time, anti-spoof face-recognition attendance pipeline.
-###### FastAPI · InsightFace · FAISS · MySQL · OpenCV
+###### A headless, LMS-integrated face-recognition attendance API.
+###### FastAPI · InsightFace · ONNX Runtime · PostgreSQL · OpenCV
 
 ![Python](https://img.shields.io/badge/python-3.11-1c1c1c?style=flat-square&logo=python&logoColor=white)
 ![FastAPI](https://img.shields.io/badge/fastapi-0.136-009688?style=flat-square&logo=fastapi&logoColor=white)
-![InsightFace](https://img.shields.io/badge/insightface-buffalo__l-ff5c00?style=flat-square)
-![FAISS](https://img.shields.io/badge/faiss-cpu-005f9e?style=flat-square)
+![InsightFace](https://img.shields.io/badge/insightface-buffalo__sc%20%2B%20buffalo__l-ff5c00?style=flat-square)
+![ONNX Runtime](https://img.shields.io/badge/onnxruntime-1.25-005f9e?style=flat-square)
 ![PostgreSQL](https://img.shields.io/badge/postgresql-16-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/license-internal-1c1c1c?style=flat-square)
 
@@ -31,19 +31,26 @@
 
 ## ❍ &nbsp; Synopsis
 
-A production-grade face-recognition attendance system for schools. Students register
-once with a handful of photos; afterwards the system identifies them from a live
-webcam feed, blocks photo/video spoofing through an active liveness challenge, and
-writes a single attendance record per student per day to MySQL.
+A production-grade face-recognition **backend** for schools, built to plug into an
+existing **LMS** — there is no UI of its own. The LMS enrolls a student once by
+posting a batch of photos; afterwards a camera client streams frames to the service,
+which recognizes each face and fires a detection callback to the LMS in real time.
 
-The pipeline runs in two interchangeable modes:
+The split of responsibility is deliberate:
+
+- **This service owns recognition** — face embedding, matching, duplicate rejection.
+- **The LMS owns attendance** — it receives `{registration_number, detected_at}` and
+  records the attendance row however it likes.
+
+Nothing but the averaged face embedding and the registration number is ever stored.
+Source images are decoded in memory and discarded.
+
+The pipeline runs in two interchangeable modes, selected by the `MODE` env var:
 
 | Mode | Detector | Recognizer | Use case |
 |------|----------|------------|----------|
 | **⚡ Lite**  | SCRFD @ 320×320 | MobileFaceNet (`w600k_mbf.onnx`, 13 MB)  | Low-end PCs, real-time on CPU |
 | **🎯 Heavy** | SCRFD @ 640×640 | ArcFace R50    (`w600k_r50.onnx`, 174 MB) | Maximum accuracy, small faces |
-
-Switch live from the dashboard — no restart required.
 
 ---
 
@@ -51,21 +58,24 @@ Switch live from the dashboard — no restart required.
 
 ```
   ┌─────────────────────┬──────────────────────────────────────────────┐
-  │  Active liveness    │  4 random challenges — blink, smile,         │
-  │                     │  turn left, turn right — driven by 106-pt    │
-  │                     │  facial landmarks. Photos and videos fail.   │
+  │  API-only           │  Three endpoints, CORS-open, JSON in/out.    │
+  │                     │  Drops behind any LMS — no frontend to host. │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  Passive anti-spoof │  MiniFASNetV2 ONNX runs alongside the        │
-  │                     │  challenge to catch screen-replay attacks.   │
+  │  Privacy-first      │  Only the 512-d averaged embedding + reg.    │
+  │  storage            │  number persist. Source photos never touch   │
+  │                     │  disk — processed in RAM, then discarded.    │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  Dual-mode FAISS    │  Separate IndexFlatIP (cosine) per backend;  │
-  │                     │  registrations populate both indices at once.│
+  │  Two-way dedup      │  Registration rejects a repeat reg. number   │
+  │                     │  AND a face already enrolled under a          │
+  │                     │  different number.                            │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  WebSocket overlay  │  Live JPEG frames + JSON progress events on  │
-  │                     │  a single socket — UI overlays in real time. │
+  │  In-memory search   │  Every embedding lives in one (N,512) NumPy  │
+  │                     │  matrix; recognition is a single dot-product │
+  │                     │  — zero DB I/O on the hot path.              │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  One-record-per-day │  Enforced at the schema level via a UNIQUE   │
-  │                     │  KEY (student_id, date) — no duplicates.     │
+  │  Detect-once        │  A student is evicted from the cache the     │
+  │                     │  moment they're recognized and the LMS is    │
+  │                     │  notified, so they aren't re-notified.       │
   └─────────────────────┴──────────────────────────────────────────────┘
 ```
 
@@ -75,209 +85,163 @@ Switch live from the dashboard — no restart required.
 
 ```mermaid
 flowchart LR
-    subgraph CLIENT["🖥️  Browser"]
-        UI[register.html<br/>dashboard.html]
-        WS_C[WebSocket Client]
+    subgraph CLIENTS["🌐  Clients"]
+        LMS_C[LMS Backend]
+        CAM[Camera client<br/>viewer.py / RTSP]
     end
 
     subgraph SERVER["⚙️  FastAPI · uvicorn :8000"]
-        API[REST API<br/>/api/*]
-        WS_S[WebSocket<br/>/ws/stream · /ws/verify]
+        REG[POST /api/register/lms]
+        FRAME[POST /api/camera/process-frame]
+        STAT[GET /api/status]
         PIPE[Pipeline<br/>detector + recognizer]
-        CHAL[Challenge Engine<br/>106-pt landmarks]
-        LIVE[Liveness Net<br/>MiniFASNetV2]
     end
 
     subgraph MODELS["🧠  ONNX Models"]
         DET[SCRFD 500M<br/>buffalo_sc/det]
         REC_H[ArcFace R50<br/>w600k_r50]
         REC_L[MobileFaceNet<br/>w600k_mbf]
-        LM[2d106det<br/>buffalo_l]
     end
 
     subgraph STORE["💾  Persistence"]
-        MYSQL[(MySQL 8.4<br/>students · attendance · embeddings)]
-        FAISS_H[(faiss_heavy.index)]
-        FAISS_L[(faiss_lite.index)]
+        PG[(PostgreSQL 16<br/>student_face_embeddings)]
+        CACHE[In-memory cache<br/>N×512 float32 matrix]
     end
 
-    UI -->|HTTP| API
-    UI -->|frames| WS_C
-    WS_C <-->|JPEG + JSON| WS_S
-    API --> PIPE
-    WS_S --> PIPE
-    WS_S --> CHAL
+    LMS_C -->|15 photos| REG
+    CAM   -->|JPEG frame| FRAME
+    REG --> PIPE
+    FRAME --> PIPE
     PIPE --> DET
     PIPE --> REC_H
     PIPE --> REC_L
-    CHAL --> LM
-    PIPE --> LIVE
-    PIPE -->|search/add| FAISS_H
-    PIPE -->|search/add| FAISS_L
-    API -->|read/write| MYSQL
+    REG -->|store vector| PG
+    PG -->|load at startup| CACHE
+    FRAME -->|cosine search| CACHE
+    FRAME -.->|detection callback| LMS_C
 
     classDef client fill:#0a0a0a,stroke:#ff5c00,color:#fff
     classDef server fill:#1c1c1c,stroke:#009688,color:#fff
     classDef model  fill:#1c1c1c,stroke:#ff5c00,color:#fff
     classDef store  fill:#1c1c1c,stroke:#4479a1,color:#fff
-    class UI,WS_C client
-    class API,WS_S,PIPE,CHAL,LIVE server
-    class DET,REC_H,REC_L,LM model
-    class MYSQL,FAISS_H,FAISS_L store
+    class LMS_C,CAM client
+    class REG,FRAME,STAT,PIPE server
+    class DET,REC_H,REC_L model
+    class PG,CACHE store
 ```
 
 ---
 
 ## ❍ &nbsp; Registration Flow
 
-When a teacher submits photos, the system embeds the face in **both** model spaces
-so a later mode-switch never invalidates a registration.
+The LMS posts **exactly 15 photos**; at least **7** must contain a detectable face.
+Each valid face is embedded, the embeddings are averaged into a single L2-normalized
+512-d vector, and the result is checked against every existing enrollment before it is
+stored.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant U as Teacher (Browser)
-    participant API as FastAPI /api/register
+    participant U as LMS Backend
+    participant API as POST /api/register/lms
     participant DET as SCRFD Detector
-    participant H as ArcFace R50
-    participant L as MobileFaceNet
-    participant DB as MySQL
-    participant FX as faiss_heavy.index
-    participant FY as faiss_lite.index
+    participant REC as Recognizer (ArcFace / MobileFaceNet)
+    participant DB as PostgreSQL
+    participant C as In-memory cache
 
-    U->>API: POST name, roll, class, photos[]
-    API->>DB: SELECT roll_number (uniqueness check)
-    loop for each photo
-        API->>DET: detect()
-        DET-->>API: bbox + 5 keypoints
-        API->>API: face_align.norm_crop → 112×112
-        API->>H: get_embedding (heavy)
-        API->>L: get_embedding (lite)
+    U->>API: registration_number + photos[] (×15)
+    API->>API: reject if count ≠ 15
+    API->>DB: registration_exists(reg_no)?
+    alt already registered
+        API-->>U: { status: 0, "already registered" }
     end
-    alt < MIN_REGISTRATION_SAMPLES
-        API-->>U: ❌ "Need at least 5 valid samples"
-    else samples sufficient
-        API->>DB: INSERT students, embeddings
-        API->>FX: add(mean(heavy_embeddings))
-        API->>FY: add(mean(lite_embeddings))
-        API-->>U: ✅ student_id, samples_used
+    loop each photo
+        API->>DET: detect() + align → 112×112
+        API->>REC: get_embedding()
     end
-```
-
----
-
-## ❍ &nbsp; Verification Flow (Active Liveness)
-
-```mermaid
-sequenceDiagram
-    autonumber
-    participant U as Browser
-    participant WS as /ws/verify
-    participant CAM as cv2.VideoCapture(0)
-    participant LM as 2d106det Landmarks
-    participant CH as Challenge State Machine
-    participant LIV as MiniFASNetV2
-    participant REC as Recognizer
-    participant DB as MySQL
-
-    U->>WS: connect
-    WS->>WS: pick 2 random challenges<br/>from {blink, smile, turn_left, turn_right}
-    WS-->>U: {type:"init", challenges}
-    loop every frame (~20 fps)
-        WS->>CAM: read()
-        WS->>LM: get_landmarks(frame)
-        LM-->>WS: 106 points
-        WS->>CH: update(metrics)
-        WS->>LIV: check(face_crop)
-        LIV-->>WS: live_score
-        WS-->>U: JPEG frame + {progress, label, metrics}
-        alt challenge.passed
-            WS->>WS: advance to next challenge
-        else timeout > 12s
-            WS-->>U: {done, success:false, reason:"timeout"}
+    alt valid faces < 7
+        API-->>U: { status: 0, "need ≥ 7 valid faces" }
+    else enough faces
+        API->>API: mean(embeddings) → L2-normalize
+        API->>DB: find_matching_student(avg)  (full scan)
+        alt face matches another reg_no
+            API-->>U: { status: 0, "face already registered" }
+        else new face
+            API->>DB: INSERT student_face_embeddings (vector BYTEA)
+            API->>C: cache.add(reg_no, avg)
+            API-->>U: { status: 1, "registered successfully" }
         end
     end
-    WS->>REC: identify(aligned_face)
-    REC-->>WS: name, confidence
-    alt name ≠ Unknown AND avg_live ≥ 0.60
-        WS->>DB: INSERT attendance (UNIQUE on student_id+date)
-        WS-->>U: {done, success:true, name, confidence}
-    else
-        WS-->>U: {done, success:false, spoof_blocked}
-    end
 ```
 
 ---
 
-## ❍ &nbsp; Liveness Challenge State Machine
+## ❍ &nbsp; Recognition Flow
+
+A camera client posts a single JPEG per call. Every detected face is matched against
+the in-memory cache; on a hit, the LMS is notified and the student is evicted so they
+aren't re-notified on the next frame.
 
 ```mermaid
-stateDiagram-v2
-    [*] --> Init
-    Init --> Challenge1: pick 2 random<br/>from pool
-    Challenge1 --> Challenge2: passed
-    Challenge2 --> Identify: passed
-    Challenge1 --> Failed: timeout 12s
-    Challenge2 --> Failed: timeout 12s
-    Identify --> Marked: name ≠ Unknown<br/>AND live_score ≥ 0.60
-    Identify --> Failed: Unknown<br/>OR spoof_blocked
-    Marked --> [*]
-    Failed --> [*]
+sequenceDiagram
+    autonumber
+    participant CAM as Camera client
+    participant API as POST /api/camera/process-frame
+    participant DET as SCRFD Detector
+    participant REC as Recognizer
+    participant C as In-memory cache
+    participant LMS as LMS_API_URL
 
-    state Challenge1 {
-        [*] --> blink: EAR drops < 0.15<br/>then > 0.22
-        [*] --> smile: mouth_ratio<br/>− baseline > 0.6
-        [*] --> turn_left: nose_x_norm<br/>+ 0.12 from baseline
-        [*] --> turn_right: nose_x_norm<br/>− 0.12 from baseline
-    }
+    CAM->>API: file = frame.jpg
+    API->>DET: detect() → faces[]
+    loop each face
+        API->>DET: align → 112×112
+        API->>REC: get_embedding()
+        API->>C: search(emb) → (reg_no, score)
+        alt score ≥ SIMILARITY_THRESHOLD
+            API->>LMS: POST { registration_number, detected_at }
+            API->>C: cache.remove(reg_no)
+            API-->>CAM: { status: "notified", registration_number }
+        else below threshold
+            API-->>CAM: { status: "unknown" }
+        end
+    end
+    API-->>CAM: { faces_detected, detected_at, results[] }
 ```
 
-The detection metrics computed every frame:
-
-| Metric | Formula | Used by |
-|--------|---------|---------|
-| `EAR` (Eye Aspect Ratio) | `(‖p1-p5‖ + ‖p2-p4‖) / (2·‖p0-p3‖)` | blink |
-| `mouth_ratio`            | `‖m_right - m_left‖ / ‖m_top - m_bottom‖` | smile |
-| `nose_x_norm`            | `(nose.x − face_center.x) / face_width` | turn_left, turn_right |
+> **Why eviction?** The cache is a "who hasn't been seen yet" set, not a full mirror
+> of the DB. Because entries are removed as students are recognized, duplicate-face
+> detection at registration (`find_matching_student`) deliberately scans the full
+> table instead of the cache.
 
 ---
 
 ## ❍ &nbsp; Data Model
 
+A single table. No source images, no attendance rows — the LMS keeps those.
+
 ```mermaid
 erDiagram
-    STUDENTS ||--o{ ATTENDANCE  : "has many"
-    STUDENTS ||--o| EMBEDDINGS  : "has one"
-
-    STUDENTS {
-        int     id PK
-        string  name
-        string  roll_number "UNIQUE"
-        string  class_name
-        string  section
-        string  photo_path
-        datetime registered_at
-        bool    is_active
-    }
-    ATTENDANCE {
-        int      id PK
-        int      student_id FK
-        date     date
-        datetime marked_at
-        float    confidence
-        string   camera_id
-    }
-    EMBEDDINGS {
-        int      id PK
-        int      student_id FK
-        datetime created_at
-        int      sample_count
+    STUDENT_FACE_EMBEDDINGS {
+        varchar   registration_number PK
+        timestamp created_at
+        int       sample_count
+        bytea     vector "512-d float32, L2-normalized"
     }
 ```
 
-> **Daily-uniqueness invariant.** `attendance` carries
-> `UNIQUE KEY (student_id, date)` — a second mark on the same day silently
-> short-circuits to `already_marked` rather than throwing.
+```sql
+CREATE TABLE IF NOT EXISTS student_face_embeddings (
+    registration_number VARCHAR(100) PRIMARY KEY,
+    created_at          TIMESTAMP DEFAULT NOW(),
+    sample_count        INT DEFAULT 0,
+    vector              BYTEA NOT NULL
+);
+```
+
+> Embeddings are stored as raw `BYTEA` and searched in Python (NumPy dot-product over
+> L2-normalized vectors == cosine similarity). No `pgvector` or other extension is
+> required.
 
 ---
 
@@ -285,58 +249,111 @@ erDiagram
 
 | Layer | Component | Role |
 |-------|-----------|------|
-| **Web** | FastAPI 0.136 · Uvicorn · WebSockets | REST + binary-stream transport |
-| **Vision** | InsightFace 0.7.3 (`buffalo_sc`, `buffalo_l`) | SCRFD detection + 106-pt landmarks |
-| **Recognition** | ArcFace R50 / MobileFaceNet (ONNX Runtime) | 512-d embeddings |
-| **Anti-spoof** | MiniFASNetV2 (ONNX) | Passive liveness score |
-| **Search** | FAISS `IndexFlatIP` | Cosine similarity over normalized embeddings |
-| **Storage** | PostgreSQL 16 + `psycopg2-binary` | Students · attendance · embedding metadata |
-| **Image I/O** | OpenCV 4.9 · NumPy 1.26 · Pillow 12 | Decode, align, encode JPEG |
-| **Frontend** | Vanilla HTML + WebSocket + CSS | Zero build step |
+| **Web** | FastAPI 0.136 · Uvicorn | REST API, CORS-open |
+| **Detection** | InsightFace 0.7.3 (`buffalo_sc`) | SCRFD 500M face detector + 5-point align |
+| **Recognition** | ArcFace R50 / MobileFaceNet (ONNX Runtime 1.25) | 512-d L2-normalized embeddings |
+| **Search** | NumPy `(N,512)` matrix dot-product | Cosine similarity, in-process, zero DB I/O |
+| **Storage** | PostgreSQL 16 + `psycopg2-binary` | One embeddings table; `BYTEA` vectors |
+| **Image I/O** | OpenCV 4.9 · NumPy 1.26 | Decode, align, JPEG handling |
 
 ---
 
 ## ❍ &nbsp; Project Layout
 
 ```
-AI Pipeline Engineer/
-└── school_attendance/
-    ├── main.py                    ← FastAPI app + WebSocket endpoints
-    ├── config.py                  ← env vars, MODE, faiss_paths()
-    ├── database.py                ← PostgreSQL connection factory (psycopg2)
-    ├── schema.sql                 ← students · attendance · embeddings
-    ├── requirements.txt
-    │
-    ├── pipeline/
-    │   ├── detector.py            ← SCRFD wrapper (lite/heavy det_size)
-    │   ├── recognizer.py          ← Direct ONNX ArcFace inference
-    │   ├── liveness.py            ← MiniFASNetV2 passive check
-    │   ├── challenges.py          ← 106-pt landmark challenges
-    │   └── attendance_logic.py    ← mark_attendance · lookups
-    │
-    ├── static/
-    │   ├── index.html             ← Landing page
-    │   ├── register.html          ← Capture-and-enroll UI
-    │   └── dashboard.html         ← Live feed · mode toggle · verify modal
-    │
-    ├── embeddings/                ← FAISS indices (per mode)
-    │   ├── faiss_heavy.index
-    │   ├── faiss_lite.index
-    │   ├── names_heavy.pkl
-    │   └── names_lite.pkl
-    │
-    ├── models/
-    │   └── 2.7_80x80_MiniFASNetV2.onnx
-    │
-    ├── start.bat                  ← One-shot launcher (Windows)
-    ├── start_mysql.bat            ← Legacy helper (MySQL era — not used)
-    ├── stop_all.bat
-    └── camera_client.py           ← Optional remote-camera client
+school_attendance/
+├── main.py                 ← FastAPI app + the 3 endpoints
+├── config.py               ← env vars (DB, MODE, thresholds, LMS_API_URL, CAMERA_URL)
+├── database.py             ← psycopg2 connection · EmbeddingCache · store/lookup helpers
+├── schema.sql              ← student_face_embeddings table
+├── requirements.txt
+├── .env.example            ← copy to .env and fill in
+├── viewer.py               ← local webcam → /api/camera/process-frame (testing tool)
+│
+├── pipeline/
+│   ├── detector.py         ← SCRFD wrapper (lite/heavy det_size) + norm_crop align
+│   └── recognizer.py       ← direct ONNX ArcFace / MobileFaceNet inference
+│
+└── scripts/                ← Windows .bat helpers
+    ├── start.bat           ← activate venv + uvicorn on :8000
+    ├── restart.bat         ← free port 8000, then start
+    ├── stop.bat            ← kill server (+ viewer) on :8000
+    ├── status.bat          ← curl /api/status, print LAN address
+    └── viewer.bat          ← run viewer.py
+```
+
+> Face models are **not** vendored — InsightFace downloads them to
+> `~/.insightface/models/` on first use (see setup step 4).
+
+---
+
+## ❍ &nbsp; API Surface
+
+| Method | Path | Purpose |
+|--------|------|---------|
+| `GET`  | `/api/status` | Health + current mode + pending-student count |
+| `POST` | `/api/register/lms` | Enroll a student (multipart: `registration_number`, `photos[]` ×15) |
+| `POST` | `/api/camera/process-frame` | Recognize faces in one JPEG (`file`) + notify LMS |
+
+### `GET /api/status`
+
+```json
+{ "status": "running", "mode": "heavy", "students_pending": 42 }
+```
+
+### `POST /api/register/lms`
+
+Multipart form: `registration_number` (string) + `photos[]` (exactly 15 image files,
+≥ 7 with a detectable face).
+
+```bash
+curl -X POST http://localhost:8000/api/register/lms \
+  -F "registration_number=2026-CS-001" \
+  -F "photos[]=@1.jpg" -F "photos[]=@2.jpg" ...  # 15 files total
+```
+
+```jsonc
+// success
+{ "success": true,  "status": 1, "message": "Face registered successfully" }
+// failures (HTTP 200, status 0):
+//   "Exactly 15 photos required, received N"
+//   "registration_number <X> is already registered"
+//   "Only N photo(s) had a detectable face, at least 7 required"
+//   "This face is already registered under registration_number <Y>"
+```
+
+### `POST /api/camera/process-frame`
+
+Multipart form: `file` (one JPEG/image).
+
+```bash
+curl -X POST http://localhost:8000/api/camera/process-frame -F "file=@frame.jpg"
+```
+
+```json
+{
+  "faces_detected": 1,
+  "detected_at": "2026-05-29T11:30:00",
+  "results": [
+    { "registration_number": "2026-CS-001", "status": "notified", "detected_at": "2026-05-29T11:30:00" }
+  ]
+}
+```
+
+Unrecognized faces return `{ "status": "unknown" }`.
+
+### LMS detection callback
+
+For each recognized face the service POSTs to `LMS_API_URL` (fire-and-forget — failures
+are logged, never raised):
+
+```json
+{ "registration_number": "2026-CS-001", "detected_at": "2026-05-29T11:30:00" }
 ```
 
 ---
 
-## ❍ &nbsp; Setup On Another PC
+## ❍ &nbsp; Setup
 
 > Tested on **Windows 11 / Python 3.11 / PostgreSQL 16**. Linux works with minor
 > path edits.
@@ -347,56 +364,49 @@ AI Pipeline Engineer/
 |------|---------|-------|
 | Python | **3.11** | InsightFace wheel is `cp311` — do not skip |
 | PostgreSQL | **16.x** | Port 5432 default |
-| Git | any | |
-| Webcam | any | Built-in or USB |
+| Webcam / IP camera | any | For the camera client |
 
-### 2 · Clone
-
-```bash
-git clone https://github.com/AI-SATA-Technologies/AI-Pipeline-Engineer.git
-cd "AI-Pipeline-Engineer/school_attendance"
-```
-
-### 3 · Virtualenv + Dependencies
+### 2 · Virtualenv + dependencies
 
 ```powershell
+cd school_attendance
 python -m venv venv
 venv\Scripts\activate
 pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-> **InsightFace gotcha.** `requirements.txt` references a local wheel
-> (`insightface-0.7.3-cp311-cp311-win_amd64.whl`). Drop that wheel in
-> `school_attendance/` before installing, or run
-> `pip install insightface==0.7.3` and let pip build it (needs C++ build tools).
+> **InsightFace note.** If `pip install insightface==0.7.3` tries to build from source,
+> install C++ build tools, or drop a prebuilt `insightface-0.7.3-cp311-cp311-win_amd64.whl`
+> in `school_attendance/` and `pip install` that file directly.
 
-### 4 · ONNX Model Cache
+### 3 · PostgreSQL
 
-InsightFace downloads model packs to `~/.insightface/models/` on first use.
-Pre-warming the cache avoids a slow first request:
+```bash
+psql -U postgres -f schema.sql
+```
+
+### 4 · Pre-warm the ONNX model cache
+
+InsightFace downloads model packs to `~/.insightface/models/` on first use. Pre-warming
+avoids a slow first request:
 
 ```bash
 python -c "import insightface; insightface.app.FaceAnalysis(name='buffalo_sc').prepare(ctx_id=0)"
 python -c "import insightface; insightface.app.FaceAnalysis(name='buffalo_l').prepare(ctx_id=0)"
 ```
 
-This populates:
+This populates the two files the recognizer loads directly:
 
 ```
-~/.insightface/models/buffalo_l/   →  w600k_r50.onnx + 2d106det.onnx + …
-~/.insightface/models/buffalo_sc/  →  w600k_mbf.onnx + det_500m.onnx
+~/.insightface/models/buffalo_l/w600k_r50.onnx   ← heavy
+~/.insightface/models/buffalo_sc/w600k_mbf.onnx  ← lite
+~/.insightface/models/buffalo_sc/det_500m.onnx   ← detector (both modes)
 ```
 
-### 5 · PostgreSQL
+### 5 · `.env`
 
-```sql
-psql -U postgres -f schema.sql
-```
-
-### 6 · `.env`
-
-Create `school_attendance/.env`:
+Copy `.env.example` to `.env` and fill it in:
 
 ```env
 DB_HOST=localhost
@@ -406,25 +416,33 @@ DB_PASS=your_postgres_password
 DB_NAME=school_attendance
 
 MODE=heavy
-LIVENESS_THRESHOLD=0.60
 SIMILARITY_THRESHOLD=0.40
-MIN_REGISTRATION_SAMPLES=5
+
+LMS_API_URL=https://your-lms.example.com/api/attendance
+CAMERA_URL=0          # webcam index, or rtsp://user:pass@host:554/stream
 ```
 
-### 7 · Run
+### 6 · Run
 
 ```bash
-.\start.bat
+cd school_attendance
+uvicorn main:app --host 0.0.0.0 --port 8000
 ```
 
-Then open:
+On Windows you can use the helpers in `scripts/` instead (`start.bat`, `status.bat`,
+`stop.bat`, …). Then:
 
-| Page | URL |
-|------|-----|
-| Live attendance dashboard | `http://localhost:8000/static/dashboard.html` |
-| Student registration | `http://localhost:8000/static/register.html` |
-| Auto-generated API docs | `http://localhost:8000/docs` |
-| JSON status probe | `http://localhost:8000/api/status` |
+| Resource | URL |
+|----------|-----|
+| Interactive API docs | `http://localhost:8000/docs` |
+| Status probe | `http://localhost:8000/api/status` |
+
+To test recognition with this PC's webcam, start the server, then run the local viewer:
+
+```bash
+cd school_attendance
+python viewer.py            # or scripts\viewer.bat ;  press Q to quit
+```
 
 ---
 
@@ -433,29 +451,11 @@ Then open:
 | Variable | Default | Effect |
 |----------|---------|--------|
 | `MODE` | `heavy` | `lite` swaps to MobileFaceNet + 320×320 detector |
-| `LIVENESS_THRESHOLD` | `0.60` | Passive liveness cutoff (avg over verification window) |
 | `SIMILARITY_THRESHOLD` | `0.40` | Cosine score below this → `Unknown` |
-| `MIN_REGISTRATION_SAMPLES` | `5` | Photos that must yield a valid embedding |
-| `CAMERA_INTERVAL` | `5` | Frame interval for the optional `camera_client.py` |
+| `LMS_API_URL` | *(empty)* | Detection callback target; empty disables notifications |
+| `CAMERA_URL` | *(empty)* | Webcam index (e.g. `0`) or full RTSP/HTTP stream URL |
+| `MIN_REGISTRATION_SAMPLES` | `5` | Loaded for reference; the LMS endpoint enforces a fixed **15-upload / 7-valid** rule |
 | `DB_*` | — | PostgreSQL credentials (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`) |
-
----
-
-## ❍ &nbsp; API Surface
-
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET`    | `/api/status` | Health + mode + index size |
-| `GET`    | `/api/mode` | Current pipeline mode |
-| `POST`   | `/api/mode` | Hot-swap mode (`lite` ⇄ `heavy`) |
-| `POST`   | `/api/register` | Enroll a student (multi-photo) |
-| `POST`   | `/api/process-frame` | Single-frame detect + recognize + mark |
-| `GET`    | `/api/attendance` | Filtered attendance log |
-| `GET`    | `/api/attendance/export` | CSV export by date |
-| `GET`    | `/api/students` | Active students roster |
-| `DELETE` | `/api/student/{id}` | Soft-delete (`is_active=0`) |
-| `WS`     | `/ws/stream` | Live preview (no marking) |
-| `WS`     | `/ws/verify` | Active-liveness verify + mark |
 
 ---
 
@@ -469,11 +469,19 @@ Then open:
   Embedding   │   512-d                            │   512-d
   Speed (CPU) │   ~25–35 ms / frame               │   ~90–140 ms / frame
   Accuracy    │   Good (close-range, single face) │   Excellent (small/angled faces)
-  FAISS Index │   embeddings/faiss_lite.index     │   embeddings/faiss_heavy.index
 ```
 
-> **Embeddings from R50 ≠ MobileFaceNet** — they live in different spaces.
-> Registration always writes both to keep the indices in sync.
+> **Embeddings from R50 ≠ MobileFaceNet** — they live in different vector spaces.
+> All students must be enrolled and recognized under the **same** `MODE`; switching
+> mode means re-enrolling. (There is no longer a dual-index that keeps both in sync.)
+
+---
+
+## ❍ &nbsp; Security Notes
+
+The API is currently **unauthenticated** and **CORS-open** (`allow_origins=['*']`). It is
+designed to run on a trusted LAN behind the LMS. Before exposing it publicly, add an
+auth layer (API key / bearer token) and lock CORS down to the LMS origin.
 
 ---
 
@@ -481,55 +489,37 @@ Then open:
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Only 0 valid face samples found` | Faces not detected in upload | Use bright photos, single face, looking ahead |
-| `Unknown` returned for known student | Liveness blocking, threshold too high, or wrong mode | Check `/api/status`; verify the right index has the student |
-| `psycopg2.OperationalError: could not connect to server` | PostgreSQL not running | Start PostgreSQL service (`pg_ctl start` or Services panel) |
-| Cold start very slow | ONNX models downloading | One-time; see step 4 above |
-| Verify modal stuck on "Connecting…" | Webcam in use elsewhere | Close Zoom/Teams/Chrome tabs holding the camera |
-
-Diagnostic scripts shipped in the repo:
-
-```
-diagnose.py        → end-to-end pipeline sanity check
-live_test.py       → live camera + cosine-similarity readout
-liveness_check.py  → MiniFASNetV2 score on a known photo
-verify_live.py     → FAISS top-k for the current camera face
-```
+| `Only N photo(s) had a detectable face` | Faces not detected in upload | Bright photos, single face, looking ahead; need ≥ 7 of 15 |
+| `unknown` for a known student | Threshold too high, or enrolled under a different `MODE` | Check `/api/status` mode; re-enroll under the active mode |
+| `psycopg2.OperationalError: could not connect` | PostgreSQL not running | Start the PostgreSQL service |
+| Cold start very slow | ONNX models downloading | One-time; pre-warm with setup step 4 |
+| LMS never receives detections | `LMS_API_URL` empty/unreachable | Set it in `.env`; check server logs for `[lms] notify failed` |
 
 ---
 
 ## ❍ &nbsp; Roadmap
 
 ```
-✓  Dual-mode pipeline (lite / heavy)
-✓  Active 4-challenge liveness
-✓  Passive MiniFASNetV2 anti-spoof
-✓  Daily-unique attendance constraint
-✓  CSV export
-☐  Multi-camera ingestion
+✓  Headless, LMS-integrated API (no UI)
+✓  15-photo enrollment with averaged embeddings
+✓  Two-way duplicate rejection (registration number + face)
+✓  In-memory cosine recognition (zero DB I/O on the hot path)
+✓  Privacy-first storage (no source images persisted)
+✓  Dual model modes (lite / heavy)
+✓  LMS detection callback
+☐  API authentication + tightened CORS
+☐  Liveness / anti-spoof (active challenge + passive net)
 ☐  GPU runtime (CUDAExecutionProvider)
-☐  Per-class scheduling (timetable-aware marking)
-☐  Mobile capture client (PWA)
-☐  Encrypted embedding store
+☐  Multi-camera ingestion
+☐  Per-session notification dedup window
 ```
 
 ---
 
 ## ❍ &nbsp; Team
 
-This is a team project — anyone on the team can clone, configure with their own
-`.env`, and run locally. Branch naming: `feature/<short-name>`,
-`fix/<short-name>`. Open a PR against `main` for review.
-
-```
-   ──────────────────────────────────────────────────
-                    C R E A T E D    B Y
-   ──────────────────────────────────────────────────
-
-                          ┌────┐
-                          │ R1 │
-                          └────┘
-```
+A team project — clone, configure your own `.env`, and run locally. Branch naming:
+`feature/<short-name>`, `fix/<short-name>`. Open a PR against `main` for review.
 
 <div align="center">
 
