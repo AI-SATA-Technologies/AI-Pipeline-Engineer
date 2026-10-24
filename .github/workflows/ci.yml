@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ['3.11', '3.13']
+    defaults:
+      run:
+        working-directory: school_attendance
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+          cache-dependency-path: school_attendance/requirements*.txt
+
+      - name: Install dependencies
+        # Headless OpenCV on CI (no display / libGL on the runner).
+        run: |
+          sed 's/^opencv-python==/opencv-python-headless==/' requirements.txt > /tmp/requirements.txt
+          sed 's#^-r requirements.txt#-r /tmp/requirements.txt#' requirements-dev.txt > /tmp/requirements-dev.txt
+          pip install -r /tmp/requirements-dev.txt
+
+      - name: Lint
+        run: ruff check .
+
+      - name: Tests
+        # No database or ONNX models needed: the suite uses fakes for both.
+        run: pytest
+
+      - name: Dependency vulnerability audit
+        run: pip-audit -r requirements.txt --strict

@@ -1,29 +1,25 @@
+import config  # noqa: F401  (must be first: sets OpenCV limits before cv2 is imported)
+
 import asyncio
 import logging
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, UTC
 
-import cv2
-import numpy as np
-import requests
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi import Depends, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 
+import database
+import lms
+from attendance import AttendanceService, today
 from auth import require_api_key
+from camera_worker import CameraWorker
 from config import (
-    MODE, LMS_API_URL, ALLOWED_ORIGINS, MAX_UPLOAD_BYTES,
-    REQUIRED_UPLOAD, REQUIRED_VALID,
+    ALLOWED_ORIGINS, API_KEYS, CAMERA_FPS, CAMERA_ID, CAMERA_URL, MAX_REQUEST_BYTES,
+    MAX_UPLOAD_BYTES, MODE, OBSOLETE_KEYS_SET, REQUIRED_UPLOAD,
 )
-from database import (
-    embedding_cache,
-    dedup_index,
-    store_lms_embedding,
-    registration_exists,
-    find_matching_student,
-    StorageError,
-)
-from pipeline.detector import FaceDetector
-from pipeline.recognizer import FaceRecognizer
+from database import StorageError, dedup_index, embedding_cache
+from limits import BodySizeLimitMiddleware
+from pipeline.engine import InvalidImage, Pipeline
 
 logging.basicConfig(
     level=logging.INFO,
@@ -31,85 +27,68 @@ logging.basicConfig(
 )
 logger = logging.getLogger('attendance')
 
-
-# ─── Pipeline ─────────────────────────────────────────────────────────────────
-class Pipeline:
-    def __init__(self):
-        self.detector = FaceDetector(mode=MODE)
-        self.recognizer = FaceRecognizer(mode=MODE)
-        logger.info('%s pipeline ready', MODE.upper())
-
-    def embed_frame(self, data: bytes) -> list[np.ndarray | None]:
-        """Decode + detect + embed every face in a frame (CPU-bound; run in a thread).
-        Returns one entry per detected face, preserving order (None if unusable)."""
-        frame = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-        if frame is None:
-            raise ValueError('invalid image data')
-        out = []
-        for face in self.detector.detect(frame):
-            aligned = self.detector.align_face(frame, face)
-            out.append(self.recognizer.get_embedding(aligned))
-        return out
-
-    def embed_photos(self, blobs: list[bytes]) -> list[np.ndarray]:
-        """Extract one embedding per registration photo that has a usable face."""
-        embeddings = []
-        for data in blobs:
-            img = cv2.imdecode(np.frombuffer(data, np.uint8), cv2.IMREAD_COLOR)
-            if img is None:
-                continue
-            faces = self.detector.detect(img)
-            if not faces:
-                continue
-            aligned = self.detector.align_face(img, faces[0])
-            emb = self.recognizer.get_embedding(aligned)
-            if emb is not None:
-                embeddings.append(emb)
-        return embeddings
-
-
 pipeline = Pipeline()
+logger.info('%s pipeline ready (%s)', MODE.upper(), pipeline.model_name)
+outbox = lms.LmsOutbox() if lms.enabled() else None
+service = AttendanceService(pipeline, outbox)
+camera: CameraWorker | None = None
 
 
 # ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _read_limited(file: UploadFile) -> bytes:
-    """Read an upload, rejecting anything over MAX_UPLOAD_BYTES."""
-    data = await file.read()
+    """Read an upload, rejecting anything over MAX_UPLOAD_BYTES without
+    loading more than MAX_UPLOAD_BYTES + 1 bytes into memory."""
+    data = await file.read(MAX_UPLOAD_BYTES + 1)
     if len(data) > MAX_UPLOAD_BYTES:
         raise HTTPException(status_code=413, detail=f'File exceeds {MAX_UPLOAD_BYTES}-byte limit')
     return data
 
 
-async def _notify_lms(registration_number: str, detected_at: str) -> None:
-    """POST a detection event to the LMS API (non-blocking; errors logged, not raised)."""
-    if not LMS_API_URL:
-        return
-    payload = {'registration_number': registration_number, 'detected_at': detected_at}
-    try:
-        await asyncio.to_thread(requests.post, LMS_API_URL, json=payload, timeout=5)
-    except Exception as exc:
-        logger.warning('LMS notify failed for %s: %s', registration_number, exc)
+def _require_ready() -> None:
+    if not service.ready:
+        raise HTTPException(status_code=503, detail='service not ready: database unavailable')
 
 
-def _now_utc() -> str:
-    return datetime.now(timezone.utc).isoformat(timespec='seconds')
+def _storage_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail='storage unavailable')
 
 
 # ─── App + Lifespan ───────────────────────────────────────────────────────────
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    global camera
+    if not API_KEYS:
+        logger.warning('API_KEY is not set: registration and attendance endpoints are OPEN '
+                       'to anyone who can reach this server. Set API_KEY in .env.')
+    if OBSOLETE_KEYS_SET:
+        logger.info('ignoring obsolete .env settings: %s', ', '.join(OBSOLETE_KEYS_SET))
+
     try:
-        n_cache = await asyncio.to_thread(embedding_cache.load)
-        await asyncio.to_thread(dedup_index.load)
-        logger.info('%d student embedding(s) loaded into memory', n_cache)
+        await asyncio.to_thread(service.startup_load)
     except StorageError as exc:
-        logger.error('startup DB load failed (server will start anyway): %s', exc)
+        service.last_error = str(exc)
+        logger.error('startup DB load failed (retrying every 10s; endpoints return 503 '
+                     'until it succeeds): %s', exc)
+    maintenance = asyncio.create_task(service.maintain(), name='maintenance')
+    if outbox is not None:
+        await outbox.start()
+    if CAMERA_URL:
+        camera = CameraWorker(CAMERA_URL, CAMERA_ID, CAMERA_FPS, pipeline, service)
+        camera.start()
+
     yield
 
+    if camera is not None:
+        await asyncio.to_thread(camera.stop)
+    maintenance.cancel()
+    if outbox is not None:
+        await outbox.stop()
 
-app = FastAPI(title='School Face Attendance API', version='3.1', lifespan=lifespan)
+
+app = FastAPI(title='School Face Attendance API', version='3.2', lifespan=lifespan)
+app.add_middleware(BodySizeLimitMiddleware, max_bytes=MAX_REQUEST_BYTES)
 
 # CORS is opt-in: only enabled when ALLOWED_ORIGINS is configured.
 if ALLOWED_ORIGINS:
@@ -121,61 +100,76 @@ if ALLOWED_ORIGINS:
     )
 
 
-# ─── Status ───────────────────────────────────────────────────────────────────
+# ─── Health / status ──────────────────────────────────────────────────────────
+
+@app.get('/healthz')
+def healthz():
+    """Liveness probe: the process is up (says nothing about the database)."""
+    return {'status': 'ok'}
+
+
 @app.get('/api/status')
 def status():
+    db_ok = database.ping()
+    lms_pending = None
+    if db_ok and service.ready:
+        try:
+            lms_pending = database.count_pending()
+        except StorageError:
+            db_ok = False
     return {
         'status': 'running',
+        'ready': service.ready,
+        'db_ok': db_ok,
         'mode': MODE,
+        'model': service.model,
+        'attendance_date': service.loaded_day.isoformat() if service.loaded_day else None,
         'students_pending': len(embedding_cache),
         'registered_total': len(dedup_index),
+        'ignored_other_model': service.other_model_count,
+        'lms_enabled': lms.enabled(),
+        'lms_pending': lms_pending,
+        'camera': camera.status() if camera else None,
     }
 
 
 # ─── Process single frame ──────────────────────────────────────────────────────
+
 @app.post('/api/camera/process-frame', dependencies=[Depends(require_api_key)])
 async def process_frame(file: UploadFile = File(...)):
     """
-    Submit a single JPEG frame / image. Notifies the LMS for each recognised face
-    and returns the registration number and detection time. Used by viewer.py and
-    for manual image-upload testing.
+    Submit a single JPEG/PNG frame. Records attendance for each recognised face
+    (the LMS is notified asynchronously, with retries) and returns per-face
+    results in detection order, each with its bounding box.
+
+    status per face: notified (newly marked), already_marked (seen earlier today),
+    unknown, or error (could not be recorded; will be detected again).
     """
+    _require_ready()
     data = await _read_limited(file)
     try:
-        embeddings = await asyncio.to_thread(pipeline.embed_frame, data)
-    except ValueError:
+        faces = await asyncio.to_thread(pipeline.embed_frame, data)
+    except InvalidImage:
         raise HTTPException(status_code=400, detail='Invalid image data')
-
-    detected_at = _now_utc()
-    results = []
-    for emb in embeddings:
-        reg = embedding_cache.claim(emb) if emb is not None else None
-        if reg is None:
-            results.append({'status': 'unknown'})
-            continue
-        await _notify_lms(reg, detected_at)
-        results.append({
-            'registration_number': reg,
-            'status': 'notified',
-            'detected_at': detected_at,
-        })
+    results = await asyncio.to_thread(service.record_faces, faces, 'api')
     return {
         'faces_detected': len(results),
-        'detected_at': detected_at,
+        'detected_at': datetime.now(UTC).isoformat(timespec='seconds'),
         'results': results,
     }
 
 
 # ─── Register student (LMS integration) ───────────────────────────────────────
+
 @app.post('/api/register/lms', dependencies=[Depends(require_api_key)])
 async def register_from_lms(
-    registration_number: str = Form(...),
+    registration_number: str = Form(''),
     photos: list[UploadFile] = File(..., alias='photos[]'),
 ):
     """
     Register a student from the LMS. Requires exactly REQUIRED_UPLOAD images in a
-    single array (key: photos[]); at least REQUIRED_VALID must contain a detectable
-    face. Returns status 1 on success, 0 on failure.
+    single array (key: photos[]); at least REQUIRED_VALID must contain a clear,
+    consistent face. Returns status 1 on success, 0 on failure.
 
     Rejects the request if the registration_number is already registered, or if the
     submitted face is already registered under another number.
@@ -185,61 +179,56 @@ async def register_from_lms(
             'success': False, 'status': 0,
             'message': f'Exactly {REQUIRED_UPLOAD} photos required, received {len(photos)}',
         }
-
-    try:
-        if registration_exists(registration_number):
-            return {
-                'success': False, 'status': 0,
-                'message': f'registration_number {registration_number} is already registered',
-            }
-    except StorageError:
-        raise HTTPException(status_code=503, detail='storage unavailable')
-
+    _require_ready()
     blobs = [await _read_limited(p) for p in photos]
-    embeddings = await asyncio.to_thread(pipeline.embed_photos, blobs)
-
-    if len(embeddings) < REQUIRED_VALID:
-        return {
-            'success': False, 'status': 0,
-            'message': f'Only {len(embeddings)} photo(s) had a detectable face, '
-                       f'at least {REQUIRED_VALID} required',
-        }
-
-    avg = np.mean(embeddings, axis=0).astype(np.float32)
-    avg /= np.linalg.norm(avg)
-
-    existing, _ = find_matching_student(avg)
-    if existing is not None:
-        return {
-            'success': False, 'status': 0,
-            'message': f'This face is already registered under registration_number {existing}',
-        }
-
     try:
-        store_lms_embedding(registration_number, avg, len(embeddings))
+        return await service.register(registration_number, blobs)
     except StorageError:
-        raise HTTPException(status_code=503, detail='storage unavailable')
-
-    embedding_cache.add(registration_number, avg)
-    dedup_index.add(registration_number, avg)
-    logger.info('registered %s (%d valid samples)', registration_number, len(embeddings))
-
-    return {'success': True, 'status': 1, 'message': 'Face registered successfully'}
+        raise _storage_unavailable()
 
 
-# ─── Cache reload (new attendance day) ─────────────────────────────────────────
+# ─── Student management ───────────────────────────────────────────────────────
+
+@app.delete('/api/students/{registration_number:path}', dependencies=[Depends(require_api_key)])
+async def delete_student(registration_number: str):
+    """Delete a student's face data (leaver / erasure request). Attendance history
+    is kept. The student can then be registered again."""
+    _require_ready()
+    try:
+        deleted = await service.delete_student(registration_number)
+    except StorageError:
+        raise _storage_unavailable()
+    if not deleted:
+        raise HTTPException(status_code=404, detail='registration_number not found')
+    return {'deleted': True, 'registration_number': registration_number}
+
+
+@app.get('/api/attendance', dependencies=[Depends(require_api_key)])
+async def list_attendance(day: date | None = Query(None, alias='date')):
+    """Attendance recorded on a day (default: today) with LMS delivery status."""
+    day = day or today()
+    try:
+        events = await asyncio.to_thread(database.list_events, day)
+    except StorageError:
+        raise _storage_unavailable()
+    return {'date': day.isoformat(), 'count': len(events), 'events': events}
+
+
+# ─── Cache reload ─────────────────────────────────────────────────────────────
+
 @app.post('/api/cache/reload', dependencies=[Depends(require_api_key)])
 async def reload_cache():
-    """Reload all embeddings from PostgreSQL — repopulates the detect-once
-    attendance cache for a new day without restarting the server."""
+    """Reload embeddings from PostgreSQL (e.g. after editing the DB by hand).
+    Students already marked today stay marked; the day rolls over automatically."""
     try:
-        n_cache = await asyncio.to_thread(embedding_cache.load)
-        n_dedup = await asyncio.to_thread(dedup_index.load)
+        loader = service.reload if service.ready else service.startup_load
+        n_pending = await asyncio.to_thread(loader)
     except StorageError:
-        raise HTTPException(status_code=503, detail='storage unavailable')
-    return {'reloaded': True, 'students_pending': n_cache, 'registered_total': n_dedup}
+        raise _storage_unavailable()
+    return {'reloaded': True, 'students_pending': n_pending, 'registered_total': len(dedup_index)}
 
 
 if __name__ == '__main__':
     import uvicorn
+    # Keep a single worker: attendance state lives in this process's memory.
     uvicorn.run(app, host='0.0.0.0', port=8000, reload=False)

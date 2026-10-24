@@ -12,3 +12,7 @@ school_attendance/embeddings/
 
 # Claude Code session files
 .claude/
+
+# Tool caches
+.pytest_cache/
+.ruff_cache/

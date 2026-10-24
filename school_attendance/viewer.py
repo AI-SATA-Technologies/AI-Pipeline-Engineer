@@ -1,114 +1,122 @@
 """
-viewer.py  -  Temporary live camera feed viewer (testing tool only).
+viewer.py  -  Live camera feed viewer (testing / display tool).
 
-Opens this PC's webcam, sends each frame to the running attendance server's
-/api/camera/process-frame endpoint, and shows the feed with face boxes,
-student IDs and detection time drawn on it.
+Opens a camera, sends frames to the running attendance server's
+/api/camera/process-frame endpoint, and shows the feed with the face boxes,
+registration numbers and detection times the server returns.
 
-The server handles the actual attendance (LMS notification). The API only
-returns the student ID + detection time per face -- it does NOT return the
-face box. This viewer detects faces locally (InsightFace) to know where to
-draw the rectangles, and pairs each detected face with the server result by
-detection order.
+The server does all detection and recognition and returns each face's box, so
+this viewer loads no models. Frames are sent at most VIEWER_FPS times a second.
+
+Camera source (first one set wins):
+    python viewer.py <source>       e.g. 0, rtsp://user:pass@ip:554/..., video.mp4
+    CAMERA_URL in .env
+    webcam 0
+
+Note: if the server itself reads CAMERA_URL (camera worker), the viewer is not
+needed for attendance; use it only to watch. Attendance is still recorded once
+per student per day.
 
 Start the server first, then run from school_attendance/:
     python viewer.py
 
 Press Q in the window to quit.
 """
+import config  # noqa: F401  (sets OpenCV env options before cv2 is imported)
+
 import sys
+import time
 
 import cv2
-import numpy as np
-import requests
+import httpx
 
-from config import MODE, API_KEY
-from pipeline.detector import FaceDetector
+from camera_worker import mask_source, normalize_source
+from config import API_KEY, CAMERA_URL
 
 SERVER_URL = 'http://127.0.0.1:8000/api/camera/process-frame'
-CAMERA_INDEX = 0
 JPEG_QUALITY = 80
+VIEWER_FPS = 4.0
 # Sent only when the server is configured with an API_KEY.
 HEADERS = {'X-API-Key': API_KEY} if API_KEY else {}
 
+KNOWN_STATUSES = {'notified', 'already_marked'}
 
-def draw(frame, face, result):
-    x1, y1, x2, y2 = (int(v) for v in face.bbox)
-    known = result is not None and result.get('status') == 'notified'
+
+def draw(frame, result):
+    x1, y1, x2, y2 = result['bbox']
+    known = result.get('status') in KNOWN_STATUSES
     color = (0, 255, 0) if known else (0, 0, 255)
     cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
 
-    if known:
-        label = result['registration_number']
-        time_label = result.get('detected_at', '')
-    else:
-        label = 'Unknown'
-        time_label = ''
-
+    label = result['registration_number'] if known else 'Unknown'
     cv2.putText(frame, label, (x1, max(y1 - 10, 20)),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+    time_label = result.get('detected_at', '')
     if time_label:
         cv2.putText(frame, time_label, (x1, y2 + 20),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 1)
 
 
-def main():
-    print('[viewer] Loading face detector ...')
-    detector = FaceDetector(mode=MODE)
+def open_capture(source):
+    if isinstance(source, str) and '://' in source:
+        return cv2.VideoCapture(source, cv2.CAP_FFMPEG)
+    return cv2.VideoCapture(source)
 
-    cap = cv2.VideoCapture(CAMERA_INDEX)
+
+def main():
+    raw = sys.argv[1] if len(sys.argv) > 1 else (CAMERA_URL or '0')
+    source = normalize_source(raw)
+    print(f'[viewer] Opening {mask_source(source)}')
+    cap = open_capture(source)
     if not cap.isOpened():
-        print(f'[viewer] ERROR: cannot open webcam (index {CAMERA_INDEX})')
+        print(f'[viewer] ERROR: cannot open camera source {mask_source(source)}')
+        print('[viewer] For RTSP, check the path and use the camera\'s LOCAL account '
+              '(not a cloud/Hik-Connect email).')
         sys.exit(1)
 
     print('[viewer] Running -- press Q to quit')
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            print('[viewer] Frame read failed')
-            break
+    results, status_text = [], ''
+    next_send = 0.0
+    with httpx.Client(timeout=10, headers=HEADERS) as client:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                print('[viewer] Frame read failed')
+                break
 
-        ok, buf = cv2.imencode('.jpg', frame,
-                               [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
-        if ok:
-            jpeg = buf.tobytes()
-            # Detect locally on the exact same JPEG the server receives,
-            # so the face order matches the server's results.
-            decoded = cv2.imdecode(np.frombuffer(jpeg, np.uint8),
-                                   cv2.IMREAD_COLOR)
-            faces = detector.detect(decoded)
+            now = time.monotonic()
+            if now >= next_send:
+                next_send = now + 1.0 / VIEWER_FPS
+                ok, buf = cv2.imencode('.jpg', frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+                if ok:
+                    try:
+                        resp = client.post(
+                            SERVER_URL,
+                            files={'file': ('frame.jpg', buf.tobytes(), 'image/jpeg')},
+                        )
+                        if resp.status_code == 200:
+                            results, status_text = resp.json().get('results', []), ''
+                            for r in results:
+                                if r.get('status') == 'notified':
+                                    print(f"[detected] {r['registration_number']} at {r.get('detected_at')}")
+                        else:
+                            results, status_text = [], f'server error {resp.status_code}'
+                    except httpx.HTTPError:
+                        results, status_text = [], 'server offline -- start the server first'
 
-            try:
-                resp = requests.post(
-                    SERVER_URL,
-                    files={'file': ('frame.jpg', jpeg, 'image/jpeg')},
-                    headers=HEADERS,
-                    timeout=10,
-                )
-                if resp.status_code == 200:
-                    results = resp.json().get('results', [])
-                    for i, face in enumerate(faces):
-                        result = results[i] if i < len(results) else None
-                        draw(frame, face, result)
-                        if result and result.get('status') == 'notified':
-                            print(f"[detected] {result['registration_number']} at "
-                                  f"{result.get('detected_at')}")
-                else:
-                    cv2.putText(frame, f'server error {resp.status_code}',
-                                (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
-                                0.7, (0, 0, 255), 2)
-            except requests.RequestException:
-                cv2.putText(frame, 'server offline -- start the server first',
-                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
+            # Boxes come from the last server reply (refreshed VIEWER_FPS times a second).
+            for r in results:
+                if 'bbox' in r:
+                    draw(frame, r)
+            if status_text:
+                cv2.putText(frame, status_text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX,
                             0.7, (0, 0, 255), 2)
+            cv2.putText(frame, 'VIEWER  |  Q = quit', (10, frame.shape[0] - 10),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
+            cv2.imshow('Face Attendance - Live View', frame)
 
-        cv2.putText(frame, 'TESTING VIEWER  |  Q = quit',
-                    (10, frame.shape[0] - 10),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (200, 200, 200), 1)
-        cv2.imshow('Face Attendance - Live View (testing)', frame)
-
-        if cv2.waitKey(1) & 0xFF == ord('q'):
-            break
+            if cv2.waitKey(1) & 0xFF == ord('q'):
+                break
 
     cap.release()
     cv2.destroyAllWindows()

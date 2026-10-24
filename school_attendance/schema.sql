@@ -1,17 +1,17 @@
--- PostgreSQL schema for School Face Attendance System
+-- PostgreSQL setup for School Face Attendance System
 -- No extensions required — embeddings stored as BYTEA, searched in Python.
 --
--- Run once:
+-- Run once to create the database:
 --   psql -U postgres -f schema.sql
+--
+-- The tables themselves live in migrations/*.sql. The server applies them at
+-- startup (AUTO_MIGRATE=true, the default). With AUTO_MIGRATE=false, apply them
+-- by hand, in order:
+--   psql -U postgres -d school_attendance -f migrations/001_init.sql
+--   psql -U postgres -d school_attendance -f migrations/002_attendance.sql
 
 CREATE DATABASE school_attendance;
 \c school_attendance;
 
--- LMS-integrated students: store only the registration number + embedding.
--- Source images are never persisted; only the 512-dim averaged float32 vector.
-CREATE TABLE IF NOT EXISTS student_face_embeddings (
-    registration_number VARCHAR(100) PRIMARY KEY,
-    created_at          TIMESTAMP DEFAULT NOW(),
-    sample_count        INT DEFAULT 0,
-    vector              BYTEA NOT NULL
-);
+\ir migrations/001_init.sql
+\ir migrations/002_attendance.sql

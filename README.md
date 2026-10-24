@@ -18,10 +18,10 @@
 ###### A headless, LMS-integrated face-recognition attendance API.
 ###### FastAPI · ONNX Runtime · SCRFD + ArcFace · PostgreSQL · OpenCV
 
-![Python](https://img.shields.io/badge/python-3.11-1c1c1c?style=flat-square&logo=python&logoColor=white)
-![FastAPI](https://img.shields.io/badge/fastapi-0.136-009688?style=flat-square&logo=fastapi&logoColor=white)
+![Python](https://img.shields.io/badge/python-3.11%20%7C%203.13-1c1c1c?style=flat-square&logo=python&logoColor=white)
+![FastAPI](https://img.shields.io/badge/fastapi-0.162-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![Models](https://img.shields.io/badge/models-SCRFD%20%2B%20ArcFace-ff5c00?style=flat-square)
-![ONNX Runtime](https://img.shields.io/badge/onnxruntime-1.25-005f9e?style=flat-square)
+![ONNX Runtime](https://img.shields.io/badge/onnxruntime-1.31-005f9e?style=flat-square)
 ![PostgreSQL](https://img.shields.io/badge/postgresql-16-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/license-internal-1c1c1c?style=flat-square)
 
@@ -33,17 +33,20 @@
 
 A production-grade face-recognition **backend** for schools, built to plug into an
 existing **LMS** — there is no UI of its own. The LMS enrolls a student once by
-posting a batch of photos; afterwards a camera client streams frames to the service,
-which recognizes each face and fires a detection callback to the LMS in real time.
+posting a batch of photos; afterwards the service watches a camera (it reads an RTSP
+stream itself, or a client posts frames), recognizes each face, and reports
+attendance to the LMS.
 
 The split of responsibility is deliberate:
 
-- **This service owns recognition** — face embedding, matching, duplicate rejection.
-- **The LMS owns attendance** — it receives `{registration_number, detected_at}` and
-  records the attendance row however it likes.
+- **This service owns recognition** — face embedding, matching, duplicate rejection,
+  and reliable *delivery* of each detection (it keeps a per-day attendance log that
+  doubles as a retry queue).
+- **The LMS owns attendance records** — it receives `{registration_number, detected_at}`
+  and records the attendance row however it likes.
 
-Nothing but the averaged face embedding and the registration number is ever stored.
-Source images are decoded in memory and discarded.
+Only the averaged face embedding, the registration number and the per-day detection
+log are stored. Source images are decoded in memory and discarded.
 
 The pipeline runs in two interchangeable modes, selected by the `MODE` env var:
 
@@ -61,24 +64,34 @@ heavyweight face SDK dependency.
 
 ```
   ┌─────────────────────┬──────────────────────────────────────────────┐
-  │  API-only           │  Four endpoints, optional API key + CORS.    │
-  │                     │  Drops behind any LMS — no frontend to host. │
+  │  API-only           │  Plugs behind any LMS — no frontend to host. │
+  │                     │  API-key auth (with key rotation), opt-in    │
+  │                     │  CORS, request/image size limits.            │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  Privacy-first      │  Only the 512-d averaged embedding + reg.    │
-  │  storage            │  number persist. Source photos never touch   │
-  │                     │  disk — processed in RAM, then discarded.    │
+  │  Never loses a      │  Detections are written to the DB first,     │
+  │  detection          │  then delivered to the LMS by an outbox      │
+  │                     │  that retries with backoff across restarts.  │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  Two-way dedup      │  Registration rejects a repeat reg. number   │
-  │                     │  AND a face already enrolled under a          │
-  │                     │  different number.                            │
+  │  Once per day       │  Each student is reported once per           │
+  │                     │  attendance day — even across restarts —     │
+  │                     │  and everyone resets automatically at        │
+  │                     │  midnight (ATTENDANCE_TZ).                   │
+  ├─────────────────────┼──────────────────────────────────────────────┤
+  │  Reads the camera   │  Built-in RTSP worker: TCP transport, no     │
+  │                     │  buffer lag, gentle reconnects that won't    │
+  │                     │  trip the camera's login lockout.            │
+  ├─────────────────────┼──────────────────────────────────────────────┤
+  │  Clean enrollment   │  Largest confident face per photo, outlier   │
+  │                     │  photos dropped, duplicate number AND        │
+  │                     │  duplicate face rejected — atomically.       │
   ├─────────────────────┼──────────────────────────────────────────────┤
   │  In-memory search   │  Every embedding lives in one (N,512) NumPy  │
   │                     │  matrix; recognition is a single dot-product │
-  │                     │  — zero DB I/O on the hot path.              │
+  │                     │  — zero DB reads on the hot path.            │
   ├─────────────────────┼──────────────────────────────────────────────┤
-  │  Detect-once        │  A student is evicted from the cache the     │
-  │                     │  moment they're recognized and the LMS is    │
-  │                     │  notified, so they aren't re-notified.       │
+  │  Privacy-first      │  No source photos persisted; duplicate-face  │
+  │                     │  replies don't reveal other students; face   │
+  │                     │  data can be erased per student.             │
   └─────────────────────┴──────────────────────────────────────────────┘
 ```
 
@@ -90,47 +103,53 @@ heavyweight face SDK dependency.
 flowchart LR
     subgraph CLIENTS["🌐  Clients"]
         LMS_C[LMS Backend]
-        CAM[Camera client<br/>viewer.py / RTSP]
+        RTSP[IP camera<br/>RTSP]
+        CAM[viewer.py / any client<br/>JPEG frames]
     end
 
-    subgraph SERVER["⚙️  FastAPI · uvicorn :8000"]
+    subgraph SERVER["⚙️  FastAPI · uvicorn :8000 · 1 worker"]
         REG[POST /api/register/lms]
         FRAME[POST /api/camera/process-frame]
-        STAT[GET /api/status]
-        RELOAD[POST /api/cache/reload]
+        WORKER[Camera worker<br/>CAMERA_URL]
+        SVC[Attendance service<br/>claim → record]
+        OUTBOX[LMS outbox<br/>retry + backoff]
         PIPE[Pipeline<br/>detector + recognizer]
     end
 
-    subgraph MODELS["🧠  ONNX Models"]
-        DET[SCRFD 500M<br/>buffalo_sc/det]
-        REC_H[ArcFace R50<br/>w600k_r50]
-        REC_L[MobileFaceNet<br/>w600k_mbf]
+    subgraph MODELS["🧠  ONNX Models (SHA-256 pinned)"]
+        DET[SCRFD 500M]
+        REC[ArcFace R50 /<br/>MobileFaceNet]
     end
 
     subgraph STORE["💾  Persistence"]
-        PG[(PostgreSQL 16<br/>student_face_embeddings)]
-        CACHE[In-memory cache + dedup index<br/>N×512 float32 matrices]
+        PG[(PostgreSQL<br/>student_face_embeddings<br/>attendance_events)]
+        CACHE[In-memory pending cache<br/>+ dedup index]
     end
 
     LMS_C -->|15 photos| REG
-    CAM   -->|JPEG frame| FRAME
+    CAM -->|JPEG frame| FRAME
+    RTSP -->|stream| WORKER
     REG --> PIPE
     FRAME --> PIPE
+    WORKER --> PIPE
     PIPE --> DET
-    PIPE --> REC_H
-    PIPE --> REC_L
+    PIPE --> REC
+    FRAME --> SVC
+    WORKER --> SVC
+    SVC -->|claim| CACHE
+    SVC -->|insert event| PG
     REG -->|store vector| PG
-    PG -->|load at startup / reload| CACHE
-    FRAME -->|cosine search| CACHE
-    FRAME -.->|detection callback| LMS_C
+    PG -->|load at startup / new day| CACHE
+    PG --> OUTBOX
+    OUTBOX -->|POST detection| LMS_C
 
     classDef client fill:#0a0a0a,stroke:#ff5c00,color:#fff
     classDef server fill:#1c1c1c,stroke:#009688,color:#fff
     classDef model  fill:#1c1c1c,stroke:#ff5c00,color:#fff
     classDef store  fill:#1c1c1c,stroke:#4479a1,color:#fff
-    class LMS_C,CAM client
-    class REG,FRAME,STAT,RELOAD,PIPE server
-    class DET,REC_H,REC_L model
+    class LMS_C,RTSP,CAM client
+    class REG,FRAME,WORKER,SVC,OUTBOX,PIPE server
+    class DET,REC model
     class PG,CACHE store
 ```
 
@@ -138,43 +157,39 @@ flowchart LR
 
 ## ❍ &nbsp; Registration Flow
 
-The LMS posts **exactly 15 photos** (configurable via `REQUIRED_UPLOAD`); at least **7**
-must contain a detectable face (`REQUIRED_VALID`). Each valid face is embedded, the
-embeddings are averaged into a single L2-normalized 512-d vector, and the result is
-checked against every existing enrollment before it is stored.
+The LMS posts **exactly 15 photos** (`REQUIRED_UPLOAD`). From each photo the **largest**
+face that is confident (`REG_MIN_DET_SCORE`) and big enough (`REG_MIN_FACE_PX`) is
+embedded. Photos that don't look like the rest of the set — compared with the set's
+most representative photo (`REG_CONSISTENCY_MIN`) — are dropped as outliers; at least
+**7** must remain (`REQUIRED_VALID`). They are averaged into one L2-normalized 512-d
+vector. The duplicate check and the insert run as one locked step, so two concurrent
+registrations can't both get in.
 
 ```mermaid
 sequenceDiagram
     autonumber
     participant U as LMS Backend
     participant API as POST /api/register/lms
-    participant DET as SCRFD Detector
-    participant REC as Recognizer (ArcFace / MobileFaceNet)
-    participant DB as PostgreSQL
+    participant P as Pipeline
     participant C as In-memory stores
+    participant DB as PostgreSQL
 
     U->>API: registration_number + photos[] (×15)
-    API->>API: reject if count ≠ REQUIRED_UPLOAD
+    API->>API: count = REQUIRED_UPLOAD? number valid (1–100 chars)?
     API->>DB: registration_exists(reg_no)?
     alt already registered
         API-->>U: { status: 0, "already registered" }
     end
-    loop each photo
-        API->>DET: detect() + align → 112×112
-        API->>REC: get_embedding()
-    end
-    alt valid faces < REQUIRED_VALID
-        API-->>U: { status: 0, "need ≥ 7 valid faces" }
-    else enough faces
-        API->>API: mean(embeddings) → L2-normalize
-        API->>C: find_matching_student(avg) — in-memory dedup index
-        alt face matches another reg_no
-            API-->>U: { status: 0, "face already registered" }
-        else new face
-            API->>DB: INSERT student_face_embeddings (vector BYTEA)
-            API->>C: cache.add + dedup_index.add(reg_no, avg)
-            API-->>U: { status: 1, "registered successfully" }
-        end
+    API->>P: embed_photos — largest confident face per photo
+    API->>API: drop outlier photos → need ≥ REQUIRED_VALID → average
+    Note over API,DB: registration lock
+    API->>C: dedup_index.find_match(template)
+    alt face matches another student
+        API-->>U: { status: 0, "face already registered under another number" }
+    else new face
+        API->>DB: INSERT … ON CONFLICT DO NOTHING
+        API->>C: dedup_index.add + cache.add
+        API-->>U: { status: 1, "registered successfully" }
     end
 ```
 
@@ -182,48 +197,52 @@ sequenceDiagram
 
 ## ❍ &nbsp; Recognition Flow
 
-A camera client posts a single JPEG per call. Every detected face is matched against
-the in-memory cache; on a hit, the LMS is notified and the student is evicted so they
-aren't re-notified on the next frame. The match-and-evict is a single atomic `claim()`,
-so concurrent frames can never double-notify the same student.
+Frames come from the built-in camera worker (`CAMERA_URL`) or from clients posting
+JPEGs. Each face is matched against the in-memory **pending** cache — students not yet
+marked today. A hit is claimed atomically (match + evict under one lock), written to
+`attendance_events` (unique per student per day), and queued for the LMS. If the DB
+write fails the claim is undone, so the student is simply detected again later.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    participant CAM as Camera client
-    participant API as POST /api/camera/process-frame
-    participant DET as SCRFD Detector
-    participant REC as Recognizer
-    participant C as In-memory cache
+    participant SRC as Camera worker / client
+    participant P as Pipeline
+    participant C as Pending cache
+    participant DB as attendance_events
+    participant OB as LMS outbox
     participant LMS as LMS_API_URL
 
-    CAM->>API: file = frame.jpg
-    API->>DET: detect() → faces[]
+    SRC->>P: frame
+    P-->>SRC: faces[] (bbox + embedding)
     loop each face
-        API->>DET: align → 112×112
-        API->>REC: get_embedding()
-        API->>C: claim(emb) → reg_no  (atomic match + evict)
+        SRC->>C: claim(emb)  (atomic match + evict)
         alt matched (score ≥ SIMILARITY_THRESHOLD)
-            API->>LMS: POST { registration_number, detected_at }
-            API-->>CAM: { status: "notified", registration_number }
+            SRC->>DB: INSERT event (pending) — once per student per day
+            Note right of SRC: status "notified"
+        else seen earlier today
+            Note right of SRC: status "already_marked"
         else no match
-            API-->>CAM: { status: "unknown" }
+            Note right of SRC: status "unknown"
         end
     end
-    API-->>CAM: { faces_detected, detected_at, results[] }
+    OB->>DB: pending events due?
+    OB->>LMS: POST { registration_number, detected_at }
+    alt 2xx
+        OB->>DB: lms_status = sent
+    else error / timeout / 5xx
+        OB->>DB: retry later (5 s, 10 s, 20 s … ≤ 10 min), failed after LMS_MAX_ATTEMPTS
+    end
 ```
 
-> **Why eviction?** The cache is a "who hasn't been seen yet" set, not a full mirror of
-> the DB. Because entries are removed as students are recognized, duplicate-face
-> detection at registration uses a **separate, persistent `dedup_index`** (every
-> registered embedding, never evicted) rather than the attendance cache — so it never
-> needs to re-scan the database.
+> **Day rollover.** The pending cache is rebuilt automatically when the attendance day
+> changes (in `ATTENDANCE_TZ`), and at every start/reload it excludes students already
+> marked today — so a restart never re-notifies anyone. Duplicate-face checks at
+> registration use a separate, permanent `dedup_index` (never evicted).
 
 ---
 
 ## ❍ &nbsp; Data Model
-
-A single table. No source images, no attendance rows — the LMS keeps those.
 
 ```mermaid
 erDiagram
@@ -232,17 +251,26 @@ erDiagram
         timestamp created_at
         int       sample_count
         bytea     vector "512-d float32, L2-normalized"
+        varchar   model  "w600k_r50 | w600k_mbf"
+    }
+    ATTENDANCE_EVENTS {
+        bigserial   id PK
+        varchar     registration_number
+        date        attendance_date "UNIQUE with registration_number"
+        timestamptz detected_at
+        varchar     source "api | CAMERA_ID"
+        real        score
+        varchar     lms_status "pending | sent | failed | skipped"
+        int         lms_attempts
+        text        lms_last_error
+        timestamptz next_attempt_at
     }
 ```
 
-```sql
-CREATE TABLE IF NOT EXISTS student_face_embeddings (
-    registration_number VARCHAR(100) PRIMARY KEY,
-    created_at          TIMESTAMP DEFAULT NOW(),
-    sample_count        INT DEFAULT 0,
-    vector              BYTEA NOT NULL
-);
-```
+The schema lives in `migrations/*.sql` (idempotent) and is applied at startup when
+`AUTO_MIGRATE=true` (default). `attendance_events` has no foreign key on purpose: the
+history survives when a student's face data is deleted. Embeddings are tagged with the
+`model` that produced them; only rows matching the active `MODE` are loaded.
 
 > Embeddings are stored as raw `BYTEA` and searched in Python (NumPy dot-product over
 > L2-normalized vectors == cosine similarity). No `pgvector` or other extension is
@@ -254,12 +282,15 @@ CREATE TABLE IF NOT EXISTS student_face_embeddings (
 
 | Layer | Component | Role |
 |-------|-----------|------|
-| **Web** | FastAPI 0.136 · Uvicorn | REST API; optional API-key auth + opt-in CORS |
-| **Detection** | SCRFD 500M on ONNX Runtime (`buffalo_sc/det_500m`) | Face detector + 5-point align (NumPy Umeyama, no insightface dep) |
-| **Recognition** | ArcFace R50 / MobileFaceNet (ONNX Runtime 1.25) | 512-d L2-normalized embeddings |
-| **Search** | NumPy `(N,512)` matrix dot-product | Cosine similarity, in-process, zero DB I/O |
-| **Storage** | PostgreSQL 16 + `psycopg2-binary` (pooled) | One embeddings table; `BYTEA` vectors |
-| **Image I/O** | OpenCV 4.9 · NumPy 1.26 | Decode, align, JPEG handling |
+| **Web** | FastAPI 0.162 · Uvicorn 0.54 · python-multipart 0.0.32 | REST API, API-key auth, body-size limit |
+| **Config** | pydantic-settings 2.16 | Typed, validated `.env` (fails fast on bad values) |
+| **Detection** | SCRFD 500M on ONNX Runtime 1.31 | Face detector + 5-point align (NumPy Umeyama) |
+| **Recognition** | ArcFace R50 / MobileFaceNet | 512-d L2-normalized embeddings |
+| **Search** | NumPy 2.4 `(N,512)` matrix dot-product | Cosine similarity, in-process |
+| **Storage** | PostgreSQL 16 + psycopg2-binary 2.9.13 (pooled) | Embeddings + attendance/outbox |
+| **LMS client** | httpx 0.28 (async, shared connection pool) | Outbox delivery with retries |
+| **Video / image I/O** | OpenCV 4.14 (FFmpeg) | Decode, RTSP, align |
+| **Quality** | pytest 9 · ruff · pip-audit · GitHub Actions | Tests, lint, dependency CVE audit |
 
 ---
 
@@ -267,62 +298,75 @@ CREATE TABLE IF NOT EXISTS student_face_embeddings (
 
 ```
 school_attendance/
-├── main.py                 ← FastAPI app + the 4 endpoints (auth, CORS, upload limits)
-├── auth.py                 ← env-gated X-API-Key dependency
-├── config.py               ← env vars (DB, MODE, thresholds, security, models, LMS)
-├── database.py             ← pooled psycopg2 · EmbeddingCache + DedupIndex · store/lookup
-├── schema.sql              ← student_face_embeddings table
-├── download_models.py      ← fetch the ONNX models into MODEL_DIR (one-time)
+├── main.py                 ← FastAPI routes + lifespan (startup, background tasks)
+├── attendance.py           ← attendance + registration service (shared by API and camera)
+├── camera_worker.py        ← server-side RTSP / webcam / video-file reader
+├── lms.py                  ← LMS outbox: delivery, retries, backoff
+├── database.py             ← pooled psycopg2, migrations, queries, in-memory vector stores
+├── auth.py                 ← env-gated X-API-Key dependency (multiple keys)
+├── limits.py               ← request body-size limit middleware
+├── config.py               ← typed settings (pydantic-settings)
+├── migrations/             ← idempotent schema migrations (applied at startup)
+├── schema.sql              ← creates the database + applies migrations (fresh install)
+├── download_models.py      ← fetch + SHA-256-verify the ONNX models (one-time)
+├── viewer.py               ← live view: camera → server → draws returned boxes
 ├── requirements.txt        ← runtime deps
-├── requirements-dev.txt    ← + pytest
-├── Dockerfile              ← container build
+├── requirements-dev.txt    ← + pytest, ruff, pip-audit
+├── pyproject.toml          ← ruff + pytest config
+├── Dockerfile              ← non-root, headless OpenCV, healthcheck
 ├── .env.example            ← copy to .env and fill in
-├── viewer.py               ← local webcam → /api/camera/process-frame (testing tool)
 │
 ├── pipeline/
+│   ├── engine.py           ← decode → detect → align → embed (concurrency-capped)
 │   ├── scrfd.py            ← SCRFD detector on raw ONNX Runtime
 │   ├── align.py            ← ArcFace 5-point norm_crop (NumPy Umeyama)
 │   ├── detector.py         ← detector wrapper (lite/heavy det_size) + align
-│   └── recognizer.py       ← direct ONNX ArcFace / MobileFaceNet inference
+│   ├── recognizer.py       ← ArcFace / MobileFaceNet inference
+│   └── model_files.py      ← model paths + pinned SHA-256 checksums
 │
-├── tests/                  ← pure-logic pytest suite (no DB / models needed)
+├── tests/                  ← pytest suite (fakes for DB + models: runs anywhere)
 │
-└── scripts/                ← Windows .bat helpers
-    ├── start.bat           ← activate venv + uvicorn on :8000
-    ├── restart.bat         ← free port 8000, then start
-    ├── stop.bat            ← kill server (+ viewer) on :8000
-    ├── status.bat          ← curl /api/status, print LAN address
-    └── viewer.bat          ← run viewer.py
+└── scripts/                ← Windows .bat helpers (start, restart, stop, status, viewer)
 ```
-
-> Face models are **not** vendored. Run `python download_models.py` to fetch them into
-> `MODEL_DIR` (default `~/.insightface/models/`) — see setup step 4.
 
 ---
 
 ## ❍ &nbsp; API Surface
 
-| Method | Path | Purpose |
-|--------|------|---------|
-| `GET`  | `/api/status` | Health + current mode + pending / registered counts |
-| `POST` | `/api/register/lms` | Enroll a student (multipart: `registration_number`, `photos[]` ×15) |
-| `POST` | `/api/camera/process-frame` | Recognize faces in one JPEG (`file`) + notify LMS |
-| `POST` | `/api/cache/reload` | Reload all embeddings from PostgreSQL (new attendance day) |
+| Method | Path | Auth | Purpose |
+|--------|------|------|---------|
+| `GET`    | `/healthz` | open | Liveness probe (process up) |
+| `GET`    | `/api/status` | open | Readiness, DB, mode/model, counts, LMS backlog, camera state |
+| `POST`   | `/api/register/lms` | key | Enroll a student (multipart: `registration_number`, `photos[]` ×15) |
+| `POST`   | `/api/camera/process-frame` | key | Recognize faces in one image (`file`) and record attendance |
+| `GET`    | `/api/attendance?date=YYYY-MM-DD` | key | Attendance for a day (default today) with LMS delivery status |
+| `DELETE` | `/api/students/{registration_number}` | key | Erase a student's face data (history kept); allows re-registration |
+| `POST`   | `/api/cache/reload` | key | Reload embeddings from PostgreSQL (after editing the DB by hand) |
 
-> **Auth:** when `API_KEY` is set, send it as an `X-API-Key` header on every endpoint
-> **except** `GET /api/status` (left open for health checks). When `API_KEY` is empty,
-> the endpoints are open (backward-compatible default).
+> **Auth:** when `API_KEY` is set, send it as an `X-API-Key` header ("key" rows above).
+> Several comma-separated keys are accepted, for rotation. When `API_KEY` is empty the
+> endpoints are open and a warning is logged at startup.
+>
+> Until the database has been loaded once, keyed endpoints return `503`
+> (`/api/status` → `"ready": false`); loading is retried every 10 s.
 
 ### `GET /api/status`
 
 ```json
-{ "status": "running", "mode": "heavy", "students_pending": 42, "registered_total": 1280 }
+{
+  "status": "running", "ready": true, "db_ok": true,
+  "mode": "heavy", "model": "w600k_r50", "attendance_date": "2026-10-24",
+  "students_pending": 42, "registered_total": 1280, "ignored_other_model": 0,
+  "lms_enabled": true, "lms_pending": 0,
+  "camera": { "id": "camera-1", "state": "running", "frames_processed": 5120,
+              "last_frame_at": "2026-10-24T03:15:00+00:00", "last_error": null }
+}
 ```
 
 ### `POST /api/register/lms`
 
-Multipart form: `registration_number` (string) + `photos[]` (exactly 15 image files,
-≥ 7 with a detectable face).
+Multipart form: `registration_number` (1–100 characters) + `photos[]` (exactly 15 image
+files, each ≤ `MAX_UPLOAD_BYTES`).
 
 ```bash
 curl -X POST http://localhost:8000/api/register/lms \
@@ -336,14 +380,18 @@ curl -X POST http://localhost:8000/api/register/lms \
 { "success": true,  "status": 1, "message": "Face registered successfully" }
 // failures (HTTP 200, status 0):
 //   "Exactly 15 photos required, received N"
+//   "registration_number is required" / "... at most 100 characters" / "... invalid characters"
 //   "registration_number <X> is already registered"
 //   "Only N photo(s) had a detectable face, at least 7 required"
-//   "This face is already registered under registration_number <Y>"
+//   "Only N of M photos consistently show the same person, at least 7 required"
+//   "This face is already registered under another registration_number"
+//      (names the other number only if REVEAL_DUPLICATE_MATCH=true)
 ```
 
 ### `POST /api/camera/process-frame`
 
-Multipart form: `file` (one JPEG/image; max `MAX_UPLOAD_BYTES`, default 10 MB → else `413`).
+Multipart form: `file` (one JPEG/PNG; > `MAX_UPLOAD_BYTES` → `413`; corrupt or larger
+than `MAX_IMAGE_PIXELS` → `400`).
 
 ```bash
 curl -X POST http://localhost:8000/api/camera/process-frame \
@@ -352,52 +400,65 @@ curl -X POST http://localhost:8000/api/camera/process-frame \
 
 ```json
 {
-  "faces_detected": 1,
-  "detected_at": "2026-05-29T11:30:00+00:00",
+  "faces_detected": 2,
+  "detected_at": "2026-10-24T03:30:00+00:00",
   "results": [
-    { "registration_number": "2026-CS-001", "status": "notified", "detected_at": "2026-05-29T11:30:00+00:00" }
+    { "registration_number": "2026-CS-001", "status": "notified",
+      "detected_at": "2026-10-24T03:30:00+00:00", "bbox": [412, 120, 530, 268] },
+    { "status": "unknown", "bbox": [80, 140, 170, 252] }
   ]
 }
 ```
 
-Unrecognized faces return `{ "status": "unknown" }`. Timestamps are UTC (ISO-8601).
+Per-face `status`: `notified` (newly marked; the LMS is told asynchronously),
+`already_marked` (seen earlier today), `unknown`, or `error` (could not be recorded —
+the student will be detected again). `bbox` is `[x1, y1, x2, y2]` in frame pixels.
+Timestamps are UTC (ISO-8601).
 
-### `POST /api/cache/reload`
-
-Repopulates the detect-once attendance cache (and dedup index) from the database — call
-it at the start of a new attendance day instead of restarting the server.
+### `GET /api/attendance`
 
 ```bash
-curl -X POST http://localhost:8000/api/cache/reload -H "X-API-Key: $API_KEY"
+curl "http://localhost:8000/api/attendance?date=2026-10-24" -H "X-API-Key: $API_KEY"
 ```
 
 ```json
-{ "reloaded": true, "students_pending": 1280, "registered_total": 1280 }
+{ "date": "2026-10-24", "count": 1, "events": [
+  { "registration_number": "2026-CS-001", "detected_at": "2026-10-24T08:30:00+05:00",
+    "source": "camera-1", "score": 0.6312, "lms_status": "sent",
+    "lms_attempts": 1, "lms_last_error": null } ] }
 ```
+
+### `DELETE /api/students/{registration_number}`
+
+Removes the student's embedding from the DB and memory (a leaver, a re-enrollment, or
+an erasure request). Attendance history is kept. `404` if not registered.
 
 ### LMS detection callback
 
-For each recognized face the service POSTs to `LMS_API_URL` (fire-and-forget — failures
-are logged, never raised):
+For each new attendance event the outbox POSTs to `LMS_API_URL` (with
+`Authorization: Bearer $LMS_API_TOKEN` if set). Any non-2xx reply, timeout or network
+error is retried — 5 s, 10 s, 20 s … up to 10 min apart — until `LMS_MAX_ATTEMPTS`,
+then the event is marked `failed` (visible in `/api/attendance`). Pending events are
+resent after a restart.
 
 ```json
-{ "registration_number": "2026-CS-001", "detected_at": "2026-05-29T11:30:00+00:00" }
+{ "registration_number": "2026-CS-001", "detected_at": "2026-10-24T03:30:00+00:00" }
 ```
 
 ---
 
 ## ❍ &nbsp; Setup
 
-> Tested on **Windows 11 / Python 3.11 / PostgreSQL 16**. Linux works with minor
-> path edits.
+> Tested on **Windows 11 / Python 3.11 / PostgreSQL 16**; CI also runs Python 3.13 on
+> Linux.
 
 ### 1 · Prerequisites
 
 | Tool | Version | Notes |
 |------|---------|-------|
-| Python | **3.11** | onnxruntime / opencv wheels target `cp311` |
+| Python | **3.11 – 3.13** | All dependencies ship wheels for cp311–cp313 |
 | PostgreSQL | **16.x** | Port 5432 default |
-| Webcam / IP camera | any | For the camera client |
+| Camera | IP camera (RTSP) or webcam | Optional: the API also accepts posted frames |
 
 ### 2 · Virtualenv + dependencies
 
@@ -409,26 +470,25 @@ pip install --upgrade pip
 pip install -r requirements.txt
 ```
 
-> No compiled face SDK is required — detection (SCRFD) and alignment run directly on
-> ONNX Runtime + OpenCV.
-
 ### 3 · PostgreSQL
+
+Create the database once (tables are created/updated automatically at startup):
 
 ```bash
 psql -U postgres -f schema.sql
 ```
 
-### 4 · Download the face models
+> Upgrading from v3.1? Nothing to do — the server applies `migrations/002_attendance.sql`
+> on start. Existing embeddings are tagged `w600k_r50` (heavy mode).
 
-The detector and recognizer load ONNX files from `MODEL_DIR` (default
-`~/.insightface/models`). Fetch just the files this service needs (the script also
-prunes the unused `buffalo_l` models to save several hundred MB):
+### 4 · Download the face models
 
 ```bash
 python download_models.py
 ```
 
-This populates the three files used by the pipeline:
+This downloads, **SHA-256-verifies** and keeps the three files the pipeline uses (unused
+`buffalo_l` models are pruned to save several hundred MB):
 
 ```
 ~/.insightface/models/buffalo_sc/det_500m.onnx   ← detector (both modes)
@@ -437,39 +497,28 @@ This populates the three files used by the pipeline:
 ```
 
 > If the download fails (network/proxy), place those three files under `MODEL_DIR`
-> manually, or point `MODEL_DIR` at an existing model directory.
+> manually; the script will verify them on the next run.
 
 ### 5 · `.env`
 
-Copy `.env.example` to `.env` and fill it in:
+Copy `.env.example` to `.env` and fill it in — at minimum:
 
 ```env
-DB_HOST=localhost
-DB_PORT=5432
 DB_USER=postgres
 DB_PASS=your_postgres_password
-DB_NAME=school_attendance
-
-MODE=heavy
-SIMILARITY_THRESHOLD=0.40
-REQUIRED_UPLOAD=15
-REQUIRED_VALID=7
-
-ONNX_PROVIDERS=CPUExecutionProvider
-MODEL_DIR=~/.insightface/models
-
-API_KEY=                       # set to require X-API-Key (empty = open)
-ALLOWED_ORIGINS=               # comma-separated CORS origins (empty = none)
-MAX_UPLOAD_BYTES=10485760      # 10 MB
-
+API_KEY=<long random string>        # e.g. python -c "import secrets; print(secrets.token_urlsafe(32))"
 LMS_API_URL=https://your-lms.example.com/api/attendance
+ATTENDANCE_TZ=Asia/Karachi          # the school's timezone
+CAMERA_URL=rtsp://admin:PASSWORD@192.168.18.234:554/Streaming/Channels/101
 ```
+
+See the [configuration reference](#--configuration-reference) for everything else.
 
 ### 6 · Run
 
 ```bash
 cd school_attendance
-uvicorn main:app --host 0.0.0.0 --port 8000
+uvicorn main:app --host 0.0.0.0 --port 8000      # keep ONE worker
 ```
 
 On Windows you can use the helpers in `scripts/` instead (`start.bat`, `status.bat`,
@@ -478,21 +527,25 @@ On Windows you can use the helpers in `scripts/` instead (`start.bat`, `status.b
 | Resource | URL |
 |----------|-----|
 | Interactive API docs | `http://localhost:8000/docs` |
-| Status probe | `http://localhost:8000/api/status` |
+| Status / readiness | `http://localhost:8000/api/status` |
 
-To test recognition with this PC's webcam, start the server, then run the local viewer:
+To watch the camera with recognition boxes drawn on it:
 
 ```bash
-cd school_attendance
-python viewer.py            # or scripts\viewer.bat ;  press Q to quit
+python viewer.py                 # uses CAMERA_URL, else webcam 0; press Q to quit
+python viewer.py 0               # or pass a source: webcam index, rtsp://…, video file
 ```
 
-### 7 · Tests (optional)
+### 7 · Tests, lint, audit
 
 ```bash
 pip install -r requirements-dev.txt
-pytest tests/ -q
+pytest                      # no database or models needed
+ruff check .
+pip-audit -r requirements.txt
 ```
+
+The same checks run on every push / PR (`.github/workflows/ci.yml`).
 
 ### 8 · Docker (optional)
 
@@ -500,27 +553,43 @@ Models aren't baked into the image — mount them (or run `download_models.py` i
 
 ```bash
 docker build -t school-attendance .
-docker run -p 8000:8000 --env-file .env -v ~/.insightface/models:/models school-attendance
+docker run -p 8000:8000 --env-file .env -v ~/.insightface/models:/models:ro school-attendance
 ```
+
+The image runs as a non-root user with headless OpenCV and a `/healthz` healthcheck.
 
 ---
 
 ## ❍ &nbsp; Configuration Reference
 
+Invalid values stop the server at startup with a clear message.
+
 | Variable | Default | Effect |
 |----------|---------|--------|
-| `MODE` | `heavy` | `lite` swaps to MobileFaceNet + 320×320 detector |
-| `SIMILARITY_THRESHOLD` | `0.40` | Cosine score below this → `Unknown` |
-| `REQUIRED_UPLOAD` | `15` | Photos that must be uploaded per registration |
-| `REQUIRED_VALID` | `7` | Minimum of those that must contain a detectable face |
-| `API_KEY` | *(empty)* | If set, write/processing endpoints require header `X-API-Key`; empty = open |
-| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated CORS origins; empty = no cross-origin browser access |
-| `MAX_UPLOAD_BYTES` | `10485760` | Max accepted size per uploaded image (10 MB); larger → `413` |
-| `ONNX_PROVIDERS` | `CPUExecutionProvider` | Comma-separated ORT providers (e.g. `CUDAExecutionProvider,CPUExecutionProvider`) |
-| `MODEL_DIR` | `~/.insightface/models` | Directory holding `buffalo_sc/` + `buffalo_l/` ONNX files |
-| `LMS_API_URL` | *(empty)* | Detection callback target; empty disables notifications |
-| `DB_*` | — | PostgreSQL credentials (`DB_HOST`, `DB_PORT`, `DB_USER`, `DB_PASS`, `DB_NAME`) |
+| `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASS` / `DB_NAME` | `localhost` / `5432` / `postgres` / — / `school_attendance` | PostgreSQL connection |
 | `DB_POOL_MIN` / `DB_POOL_MAX` | `1` / `8` | Connection-pool sizing |
+| `AUTO_MIGRATE` | `true` | Apply `migrations/*.sql` at startup |
+| `MODE` | `heavy` | `lite` = MobileFaceNet + 320×320 detector (re-enroll after switching) |
+| `SIMILARITY_THRESHOLD` | `0.40` | Recognition: cosine score below this → `unknown` |
+| `DEDUP_THRESHOLD` | = similarity | Registration: score at/above this → "face already registered" |
+| `ONNX_PROVIDERS` | `CPUExecutionProvider` | Comma-separated ORT providers (e.g. `CUDAExecutionProvider,CPUExecutionProvider`) |
+| `MODEL_DIR` | `~/.insightface/models` | Directory holding `buffalo_sc/` + `buffalo_l/` |
+| `INFERENCE_CONCURRENCY` | `2` | Max inference jobs at once (frames + registrations + camera) |
+| `REQUIRED_UPLOAD` / `REQUIRED_VALID` | `15` / `7` | Photos per registration / minimum usable after filtering |
+| `REG_MIN_DET_SCORE` / `REG_MIN_FACE_PX` | `0.6` / `64` | Minimum face confidence / size in registration photos |
+| `REG_CONSISTENCY_MIN` | `0.35` | Drop registration photos less similar than this to the set's most representative photo |
+| `REVEAL_DUPLICATE_MATCH` | `false` | Name the other student in duplicate-face replies |
+| `API_KEY` | *(empty)* | Required `X-API-Key` value(s), comma-separated; empty = open (warning logged) |
+| `ALLOWED_ORIGINS` | *(empty)* | Comma-separated CORS origins; empty = no cross-origin browser access |
+| `MAX_UPLOAD_BYTES` | `10485760` | Max size per uploaded image (10 MB) → else `413` |
+| `MAX_REQUEST_BYTES` | `0` (auto) | Whole-request cap; `0` = `REQUIRED_UPLOAD × MAX_UPLOAD_BYTES + 1 MB` |
+| `MAX_IMAGE_PIXELS` | `40000000` | Largest image decoded (blocks decompression bombs) → else `400` |
+| `LMS_API_URL` | *(empty)* | Detection callback target; empty = events recorded as `skipped` |
+| `LMS_API_TOKEN` | *(empty)* | Sent as `Authorization: Bearer …` |
+| `LMS_TIMEOUT` / `LMS_MAX_ATTEMPTS` | `5` / `10` | Per-request timeout (s) / attempts before `failed` |
+| `ATTENDANCE_TZ` | server local | IANA timezone defining the attendance day (e.g. `Asia/Karachi`) |
+| `CAMERA_URL` | *(empty)* | Server-side camera: `0` (webcam), `rtsp://…`, or a video file; empty = none |
+| `CAMERA_ID` / `CAMERA_FPS` | `camera-1` / `2` | Label stored with events / frames analysed per second |
 
 ---
 
@@ -536,27 +605,34 @@ docker run -p 8000:8000 --env-file .env -v ~/.insightface/models:/models school-
   Accuracy    │   Good (close-range, single face) │   Excellent (small/angled faces)
 ```
 
-> **Embeddings from R50 ≠ MobileFaceNet** — they live in different vector spaces.
-> All students must be enrolled and recognized under the **same** `MODE`; switching
-> mode means re-enrolling. (There is no longer a dual-index that keeps both in sync.)
+> **Embeddings from R50 ≠ MobileFaceNet** — they live in different vector spaces. Each
+> stored embedding is tagged with its model and only those matching the active `MODE`
+> are used (`/api/status` → `ignored_other_model` counts the rest). Switching mode means
+> re-enrolling.
 
 ---
 
 ## ❍ &nbsp; Security Notes
 
-Authentication is **env-gated**: set `API_KEY` in `.env` and the `/api/register/lms`,
-`/api/camera/process-frame`, and `/api/cache/reload` endpoints require a matching
-`X-API-Key` header (compared in constant time). Leave it empty and they stay open — a
-backward-compatible default so an existing LMS integration keeps working until the key
-is configured. `GET /api/status` is intentionally left open for health checks.
-
-CORS is **opt-in**: no cross-origin browser access unless you list origins in
-`ALLOWED_ORIGINS` (avoid `*` in production). Uploads are capped at `MAX_UPLOAD_BYTES`
-(default 10 MB); larger requests get `413`. DB errors surface as a clean `503` rather
-than a stack trace.
-
-The service still binds `0.0.0.0:8000` — run it behind a firewall / reverse proxy and
-terminate TLS upstream.
+- **Set `API_KEY`.** With it set, every endpoint except `/healthz` and `/api/status`
+  requires a matching `X-API-Key` (constant-time comparison). Use a long random value;
+  list two keys during a rotation. Left empty, the API is open to anyone who can reach
+  it — the server logs a warning at every start.
+- **Use TLS.** The server speaks plain HTTP on `0.0.0.0:8000`: run it behind a reverse
+  proxy that terminates HTTPS (and can add rate limiting), or keep it on a firewalled LAN.
+- **Request limits.** Per-file (`MAX_UPLOAD_BYTES`) and whole-request
+  (`MAX_REQUEST_BYTES`) caps return `413`; images larger than `MAX_IMAGE_PIXELS` are
+  rejected before decoding, so a tiny "decompression bomb" can't exhaust memory.
+  Inference is capped at `INFERENCE_CONCURRENCY` jobs.
+- **Biometric data.** Face embeddings are biometric identifiers: restrict DB access, back
+  up securely, and use `DELETE /api/students/{reg}` for leavers and erasure requests.
+  Duplicate-face replies don't reveal the other student unless `REVEAL_DUPLICATE_MATCH=true`.
+- **Supply chain.** Model files are SHA-256-pinned (`pipeline/model_files.py`); CI runs
+  `pip-audit` against the pinned dependencies.
+- **Camera credentials** live only in `.env` and are masked in logs; `/api/status`
+  doesn't expose the camera address.
+- **Not covered yet:** liveness / anti-spoofing — a printed photo or a phone screen held
+  up to the camera can still mark attendance (see Roadmap).
 
 ---
 
@@ -564,13 +640,18 @@ terminate TLS upstream.
 
 | Symptom | Cause | Fix |
 |---------|-------|-----|
-| `Only N photo(s) had a detectable face` | Faces not detected in upload | Bright photos, single face, looking ahead; need ≥ 7 of 15 |
-| `unknown` for a known student | Threshold too high, or enrolled under a different `MODE` | Check `/api/status` mode; re-enroll under the active mode |
+| `Only N photo(s) had a detectable face` | Faces small, blurry or not detected | Bright photos, one face filling the frame, looking ahead |
+| `… consistently show the same person` | The photo set mixes people or has bad crops | Re-take the set with only the student |
+| `unknown` for a known student | Threshold too high, or enrolled under a different `MODE` | Check `/api/status` (`model`, `ignored_other_model`); re-enroll |
+| `already_marked` | Already recorded today | Expected — once per student per day |
+| `503 service not ready` | PostgreSQL unreachable at startup | Start PostgreSQL; the server retries every 10 s |
 | `401 Invalid or missing API key` | `API_KEY` set but header missing/wrong | Send `X-API-Key: <key>` |
-| `413 File exceeds … limit` | Upload larger than `MAX_UPLOAD_BYTES` | Send a smaller image or raise the limit |
-| `FileNotFoundError: … model not found` | Models not downloaded | Run `python download_models.py` (or set `MODEL_DIR`) |
-| `psycopg2.OperationalError` / `503` | PostgreSQL not running / unreachable | Start the PostgreSQL service; check `DB_*` |
-| LMS never receives detections | `LMS_API_URL` empty/unreachable | Set it in `.env`; check logs for `LMS notify failed` |
+| `413 … limit` | Upload larger than `MAX_UPLOAD_BYTES` / `MAX_REQUEST_BYTES` | Smaller images, or raise the limit |
+| `400 Invalid image data` | Corrupt image or larger than `MAX_IMAGE_PIXELS` | Send a normal JPEG/PNG |
+| LMS isn't receiving detections | `LMS_API_URL` empty/unreachable or LMS erroring | `GET /api/attendance` shows `lms_status` + `lms_last_error`; logs show retries |
+| Camera `state: reconnecting` | Wrong RTSP URL/path/credentials, camera offline | Hikvision: path `/Streaming/Channels/101`, LOCAL `admin` account. After 5 failures the worker retries every 15 min so it won't keep the camera locked |
+| `Invalid configuration (.env)` at start | A setting has a bad value | The message names the setting and the problem |
+| `FileNotFoundError: Model not found` | Models not downloaded | `python download_models.py` (or set `MODEL_DIR`) |
 
 ---
 
@@ -578,17 +659,20 @@ terminate TLS upstream.
 
 ```
 ✓  Headless, LMS-integrated API (no UI)
-✓  15-photo enrollment with averaged embeddings
-✓  Two-way duplicate rejection (registration number + face)
-✓  In-memory cosine recognition (zero DB I/O on the hot path)
-✓  Privacy-first storage (no source images persisted)
-✓  Dual model modes (lite / heavy)
-✓  LMS detection callback
-✓  API authentication (env-gated API key) + opt-in CORS
+✓  15-photo enrollment: largest-face selection, outlier rejection, averaged embedding
+✓  Two-way duplicate rejection (registration number + face), atomic
+✓  In-memory cosine recognition (zero DB reads on the hot path)
+✓  Privacy-first storage; per-student erasure
+✓  Dual model modes (lite / heavy), model-tagged embeddings
+✓  Reliable LMS delivery (outbox, retries, survives restarts)
+✓  Once-per-day attendance with automatic day rollover
+✓  Server-side RTSP camera ingestion
+✓  API-key auth with rotation · request/image limits · CI with dependency audit
 ✓  GPU runtime (configurable ONNX execution providers)
-☐  Liveness / anti-spoof (active challenge + passive net)
-☐  Multi-camera ingestion
-☐  Per-session notification dedup window
+☐  Liveness / anti-spoofing (passive model, tuned on real students)
+☐  Multi-camera ingestion (CAMERA_URLS)
+☐  Prometheus metrics
+☐  OpenCV 5 · psycopg 3 · pgvector for very large schools
 ```
 
 ---

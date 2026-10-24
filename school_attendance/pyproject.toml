@@ -1,0 +1,27 @@
+[project]
+name = "school-face-attendance"
+version = "3.2.0"
+requires-python = ">=3.11"
+
+[tool.ruff]
+line-length = 110
+target-version = "py311"
+extend-exclude = ["venv"]
+
+[tool.ruff.lint]
+# pyflakes, pycodestyle, bugbear, pyupgrade. Import sorting is left off on purpose:
+# entry points must `import config` before anything imports cv2.
+select = ["E", "F", "W", "B", "UP"]
+ignore = [
+    "B008",  # FastAPI's File()/Form()/Query() defaults are the documented pattern
+    "B904",  # `raise HTTPException(...)` inside except is intentional (no chaining needed)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"camera_worker.py" = ["E402"]  # config is imported before cv2 on purpose
+"main.py" = ["E402"]
+"viewer.py" = ["E402"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
