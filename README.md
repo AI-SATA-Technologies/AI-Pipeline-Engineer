@@ -22,8 +22,14 @@
 ![FastAPI](https://img.shields.io/badge/fastapi-0.162-009688?style=flat-square&logo=fastapi&logoColor=white)
 ![Models](https://img.shields.io/badge/models-SCRFD%20%2B%20ArcFace-ff5c00?style=flat-square)
 ![ONNX Runtime](https://img.shields.io/badge/onnxruntime-1.31-005f9e?style=flat-square)
-![PostgreSQL](https://img.shields.io/badge/postgresql-16-336791?style=flat-square&logo=postgresql&logoColor=white)
+![PostgreSQL](https://img.shields.io/badge/postgresql-12%2B-336791?style=flat-square&logo=postgresql&logoColor=white)
 ![License](https://img.shields.io/badge/license-internal-1c1c1c?style=flat-square)
+
+**📘 Full documentation: [`about project/`](about%20project/README.md)** — overview,
+requirements, setup, folder structure, configuration, API, camera, operations,
+troubleshooting, security, development.
+
+**🚀 New PC?** Double-click `school_attendance\scripts\setup.bat`.
 
 </div>
 
@@ -287,7 +293,7 @@ history survives when a student's face data is deleted. Embeddings are tagged wi
 | **Detection** | SCRFD 500M on ONNX Runtime 1.31 | Face detector + 5-point align (NumPy Umeyama) |
 | **Recognition** | ArcFace R50 / MobileFaceNet | 512-d L2-normalized embeddings |
 | **Search** | NumPy 2.4 `(N,512)` matrix dot-product | Cosine similarity, in-process |
-| **Storage** | PostgreSQL 16 + psycopg2-binary 2.9.13 (pooled) | Embeddings + attendance/outbox |
+| **Storage** | PostgreSQL 12+ (tested 17) + psycopg2-binary 2.9.13 (pooled) | Embeddings + attendance/outbox |
 | **LMS client** | httpx 0.28 (async, shared connection pool) | Outbox delivery with retries |
 | **Video / image I/O** | OpenCV 4.14 (FFmpeg) | Decode, RTSP, align |
 | **Quality** | pytest 9 · ruff · pip-audit · GitHub Actions | Tests, lint, dependency CVE audit |
@@ -326,7 +332,7 @@ school_attendance/
 │
 ├── tests/                  ← pytest suite (fakes for DB + models: runs anywhere)
 │
-└── scripts/                ← Windows .bat helpers (start, restart, stop, status, viewer)
+└── scripts/                ← Windows helpers: setup.bat (one-click install), start, restart, stop, status, viewer
 ```
 
 ---
@@ -449,15 +455,26 @@ resent after a restart.
 
 ## ❍ &nbsp; Setup
 
-> Tested on **Windows 11 / Python 3.11 / PostgreSQL 16**; CI also runs Python 3.13 on
+> Tested on **Windows 11 / Python 3.11 / PostgreSQL 17**; CI also runs Python 3.13 on
 > Linux.
+
+### ⚡ One-click setup (Windows)
+
+```
+school_attendance\scripts\setup.bat
+```
+
+It finds Python, creates the venv, installs the packages, creates `.env` (with a random
+`API_KEY`) and opens it for you to fill in, downloads and verifies the models, creates
+the database and tables, and checks that the pipeline loads. Safe to re-run. Details:
+[about project/03-setup.md](about%20project/03-setup.md). The manual steps follow.
 
 ### 1 · Prerequisites
 
 | Tool | Version | Notes |
 |------|---------|-------|
 | Python | **3.11 – 3.13** | All dependencies ship wheels for cp311–cp313 |
-| PostgreSQL | **16.x** | Port 5432 default |
+| PostgreSQL | **12+** (tested 17) | Port 5432 default |
 | Camera | IP camera (RTSP) or webcam | Optional: the API also accepts posted frames |
 
 ### 2 · Virtualenv + dependencies
@@ -512,7 +529,7 @@ ATTENDANCE_TZ=Asia/Karachi          # the school's timezone
 CAMERA_URL=rtsp://admin:PASSWORD@192.168.18.234:554/Streaming/Channels/101
 ```
 
-See the [configuration reference](#--configuration-reference) for everything else.
+See the configuration reference below (or [about project/05-configuration.md](about%20project/05-configuration.md)) for everything else.
 
 ### 6 · Run
 
@@ -601,9 +618,14 @@ Invalid values stop the server at startup with a clear message.
   Detector    │   SCRFD 500M  · 320×320           │   SCRFD 500M  · 640×640
   Recognizer  │   MobileFaceNet · 13 MB           │   ArcFace R50    · 174 MB
   Embedding   │   512-d                            │   512-d
-  Speed (CPU) │   ~25–35 ms / frame               │   ~90–140 ms / frame
+  Detect (CPU)│   ~24 ms / 720p frame             │   ~39 ms / 720p frame
+  Embed (CPU) │   ~15 ms / face                   │   ~250 ms / face
+  RAM         │   ~110 MB                          │   ~400 MB
   Accuracy    │   Good (close-range, single face) │   Excellent (small/angled faces)
 ```
+
+> Timings measured on an Intel Core i7-7600U (4 threads), CPU only. For busy entrances
+> with many faces per frame on a modest CPU, prefer lite mode or a GPU.
 
 > **Embeddings from R50 ≠ MobileFaceNet** — they live in different vector spaces. Each
 > stored embedding is tagged with its model and only those matching the active `MODE`

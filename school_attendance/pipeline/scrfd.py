@@ -54,6 +54,11 @@ class SCRFD:
         nms_thresh: float = 0.4,
     ):
         so = ort.SessionOptions()
+        # The buffalo SCRFD models declare output shapes for a 640x640 input, so at
+        # any other det_size (lite mode: 320x320) ONNX Runtime logs a harmless
+        # "Expected shape ... does not match" warning on every run. Outputs are
+        # decoded by their actual shape, so log errors only.
+        so.log_severity_level = 3
         self.session = ort.InferenceSession(model_path, sess_options=so, providers=providers)
         self.det_thresh = det_thresh
         self.nms_thresh = nms_thresh

@@ -128,6 +128,18 @@ def test_non_db_error_rolls_back_and_keeps_connection(monkeypatch):
 
 # ─── Config validation ───────────────────────────────────────────────────────
 
+def test_env_example_is_a_valid_config(monkeypatch):
+    """A fresh .env copied from .env.example must start the server."""
+    import os
+
+    from dotenv import dotenv_values
+    example = os.path.join(os.path.dirname(config.__file__), '.env.example')
+    for key, value in dotenv_values(example).items():
+        monkeypatch.setenv(key, value or '')
+    s = config.Settings()
+    assert s.DEDUP_THRESHOLD is None and s.MODE == 'heavy' and s.CAMERA_URL == ''
+
+
 def test_config_normalises_and_validates():
     assert config.Settings(MODE=' Heavy ').MODE == 'heavy'
     with pytest.raises(ValueError):

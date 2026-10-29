@@ -19,7 +19,9 @@ _OBSOLETE_KEYS = ('MIN_REGISTRATION_SAMPLES',)
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(extra='ignore', case_sensitive=True)
+    # env_ignore_empty: a blank line like "DEDUP_THRESHOLD=" (as in .env.example)
+    # means "use the default", not "the empty string".
+    model_config = SettingsConfigDict(extra='ignore', case_sensitive=True, env_ignore_empty=True)
 
     # ─── PostgreSQL ─────────────────────────────────────────────────────────
     DB_HOST: str = 'localhost'
